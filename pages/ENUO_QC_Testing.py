@@ -1,14 +1,11 @@
-# ============================================================
-# ENUO_QC_TESTING.PY
-# QC Testing - ENUO
-# ============================================================
 
-import streamlit as st
-import streamlit.components.v1 as components
-import pandas as pd
-import requests
 import json
 from io import StringIO
+
+import pandas as pd
+import requests
+import streamlit as st
+import streamlit.components.v1 as components
 
 
 # ============================================================
@@ -19,1443 +16,778 @@ st.set_page_config(
     page_title="QC Testing - ENUO",
     page_icon="🧪",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="collapsed",
 )
 
 
 # ============================================================
-# GOOGLE SHEET
+# GOOGLE SHEETS
 # ============================================================
 
 SHEET_ID = "14WOHloWhGuQOc95PrRUsYWAHT6PTCC6EL2pY18uglVs"
 SHEET_TAB = ""
 
+HC_API_URL = (
+    "https://script.google.com/macros/s/"
+    "AKfycbxtIHI5c0dgeT_ZzcqaD5CAncYtrhyxLi3Bl3LLmMyzY-GEGaRG6zjmpp4K8ui0LElOeg/exec"
+)
+
 
 # ============================================================
-# LOAD GOOGLE SHEET
+# LOAD SOURCE DATA
 # ============================================================
 
+@st.cache_data(ttl=30)
 def load_google_sheet():
 
     if SHEET_TAB:
-
         url = (
             f"https://docs.google.com/spreadsheets/d/"
             f"{SHEET_ID}/gviz/tq?"
-            f"sheet={SHEET_TAB}&tqx=out:csv"
+            f"tqx=out:csv&sheet={SHEET_TAB}"
         )
-
     else:
-
         url = (
             f"https://docs.google.com/spreadsheets/d/"
-            f"{SHEET_ID}/gviz/tq?"
-            f"tqx=out:csv"
+            f"{SHEET_ID}/gviz/tq?tqx=out:csv"
         )
 
-    # Always fetch the latest Google Sheet data when this page reruns.
-    # Do not use Streamlit cache here; other pages already update on navigation.
     response = requests.get(
         url,
         headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Cache-Control": "no-cache, no-store",
             "Pragma": "no-cache",
-            "Expires": "0",
         },
-        timeout=30
+        timeout=30,
     )
 
     response.raise_for_status()
 
-    return pd.read_csv(
-        StringIO(response.text)
+    return pd.read_csv(StringIO(response.text))
+
+
+# ============================================================
+# LOAD HC SETTINGS
+# ============================================================
+
+def load_hc_from_google_sheet():
+
+    response = requests.get(
+        HC_API_URL,
+        params={"_ts": pd.Timestamp.now().timestamp()},
+        headers={
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        },
+        timeout=20,
+    )
+
+    response.raise_for_status()
+
+    result = response.json()
+
+    if isinstance(result, dict) and result.get("success"):
+        rows = result.get("data", [])
+        return rows if isinstance(rows, list) else []
+
+    raise ValueError(
+        "HC_Settings API did not return success=true."
     )
 
 
 # ============================================================
-# LOAD LATEST DATA ON EVERY PAGE RUN
+# PREPARE SOURCE DATA
 # ============================================================
 
 try:
 
-    with st.spinner("Loading latest Google Sheet data..."):
-        df = load_google_sheet()
+    df = load_google_sheet().copy()
 
-except Exception as e:
-
-    st.error(
-        f"Unable to load Google Sheet: {e}"
+    df.columns = (
+        df.columns.astype(str).str.strip()
     )
 
+    required_columns = [
+        "Date",
+        "Device Name",
+        "Daily (JD)",
+        "Qty",
+        "MAC",
+        "Issue Type",
+        "Region",
+    ]
+
+    missing = [
+        column
+        for column in required_columns
+        if column not in df.columns
+    ]
+
+    if missing:
+        st.error(
+            "Missing columns: " + ", ".join(missing)
+        )
+        st.stop()
+
+    df["Region"] = (
+        df["Region"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    df = df[df["Region"] == "ENUO"].copy()
+
+    df["Date"] = pd.to_datetime(
+        df["Date"],
+        errors="coerce",
+    )
+
+    df = df.dropna(subset=["Date"]).copy()
+
+    # Use ISO dates for calculation and cloud keys.
+    df["DateSort"] = df["Date"].dt.strftime("%Y-%m-%d")
+
+    # Keep a readable display date.
+    df["DateDisplay"] = df["Date"].dt.strftime("%Y-%m-%d")
+
+    for column in [
+        "Device Name",
+        "Daily (JD)",
+        "Issue Type",
+        "MAC",
+    ]:
+        df[column] = (
+            df[column]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+
+    df["Daily (JD)"] = df["Daily (JD)"].str.lower()
+    df["Device Name"] = df["Device Name"].str.lower()
+    df["Issue Type"] = df["Issue Type"].str.lower()
+
+    df["Qty"] = pd.to_numeric(
+        df["Qty"],
+        errors="coerce",
+    ).fillna(0)
+
+    df = df.sort_values(
+        ["Date", "Daily (JD)"],
+        ascending=[True, True],
+    )
+
+    records = []
+
+    for _, row in df.iterrows():
+
+        records.append({
+            "date": row["DateDisplay"],
+            "date_sort": row["DateSort"],
+            "device": str(row["Device Name"]),
+            "daily": str(row["Daily (JD)"]),
+            "qty": float(row["Qty"]),
+            "mac": str(row["MAC"]),
+            "issue_type": str(row["Issue Type"]),
+        })
+
+    data_json = json.dumps(
+        records,
+        ensure_ascii=False,
+    )
+
+    # Load HC settings independently from the source data.
+    hc_records = load_hc_from_google_sheet()
+
+    hc_json = json.dumps(
+        hc_records,
+        ensure_ascii=False,
+    )
+
+except Exception as exc:
+
+    st.error(f"Unable to load data: {exc}")
     st.stop()
 
 
 # ============================================================
-# REQUIRED COLUMNS
+# HTML DASHBOARD
 # ============================================================
 
-required_columns = [
-    "Date",
-    "Device Name",
-    "Daily (JD)",
-    "Qty",
-    "MAC",
-    "Issue Type",
-    "Region"
-]
-
-missing_columns = [
-    col
-    for col in required_columns
-    if col not in df.columns
-]
-
-if missing_columns:
-
-    st.error(
-        "Missing columns: "
-        + ", ".join(missing_columns)
-    )
-
-    st.stop()
-
-
-# ============================================================
-# CLEAN DATA
-# ============================================================
-
-df["Date"] = pd.to_datetime(
-    df["Date"],
-    errors="coerce"
-)
-
-df["Device Name"] = (
-    df["Device Name"]
-    .fillna("")
-    .astype(str)
-    .str.strip()
-    .str.lower()
-)
-
-df["Daily (JD)"] = (
-    df["Daily (JD)"]
-    .fillna("")
-    .astype(str)
-    .str.strip()
-    .str.lower()
-)
-
-df["Issue Type"] = (
-    df["Issue Type"]
-    .fillna("")
-    .astype(str)
-    .str.strip()
-    .str.lower()
-)
-
-df["MAC"] = (
-    df["MAC"]
-    .fillna("")
-    .astype(str)
-    .str.strip()
-)
-
-df["Region"] = (
-    df["Region"]
-    .fillna("")
-    .astype(str)
-    .str.strip()
-    .str.upper()
-)
-
-df["Qty"] = pd.to_numeric(
-    df["Qty"],
-    errors="coerce"
-).fillna(0)
-
-
-# ============================================================
-# ENUO ONLY
-# ============================================================
-
-df = df[
-    df["Region"] == "ENUO"
-].copy()
-
-
-# ============================================================
-# DATE
-# ============================================================
-
-df = df[
-    df["Date"].notna()
-].copy()
-
-df["Date"] = df["Date"].dt.strftime(
-    "%Y-%m-%d"
-)
-
-
-# ============================================================
-# CONVERT TO JSON
-# ============================================================
-
-records = []
-
-for _, row in df.iterrows():
-
-    records.append({
-        "date": str(row["Date"]),
-        "device": str(row["Device Name"]),
-        "daily": str(row["Daily (JD)"]),
-        "qty": float(row["Qty"]),
-        "mac": str(row["MAC"]),
-        "issueType": str(row["Issue Type"]),
-        "region": str(row["Region"])
-    })
-
-
-data_json = json.dumps(
-    records,
-    ensure_ascii=False
-)
-
-
-# ============================================================
-# HTML
-# ============================================================
-
-html = """
+html = r"""
 <!DOCTYPE html>
-
 <html>
-
 <head>
-
 <meta charset="UTF-8">
-
-<meta
-    name="viewport"
-    content="width=device-width, initial-scale=1.0"
->
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QC Testing - ENUO</title>
 
 <style>
-
-* {
-    box-sizing: border-box;
-}
+* { box-sizing: border-box; }
 
 body {
     margin: 0;
-    padding: 0;
-
-    font-family:
-        Arial,
-        Helvetica,
-        sans-serif;
-
+    padding: 24px;
     background: #f5f7fb;
-
+    font-family: Arial, Helvetica, sans-serif;
     color: #1f2937;
 }
 
+.header { margin-bottom: 20px; }
 
-/* ============================================================
-   HEADER
-   ============================================================ */
-
-.header {
-    background: white;
-
-    padding: 20px 25px;
-
-    border-radius: 14px;
-
-    margin-bottom: 18px;
-
-    box-shadow:
-        0 2px 10px rgba(0,0,0,0.06);
-
-    display: flex;
-
-    justify-content: space-between;
-
-    align-items: center;
-}
-
-.header-left {
-    display: flex;
-
-    flex-direction: column;
-
-    gap: 5px;
-}
-
-.title {
+.header h1 {
+    margin: 0;
     font-size: 28px;
-
-    font-weight: 800;
-
+    font-weight: 700;
     color: #111827;
 }
 
-.subtitle {
-    font-size: 14px;
-
+.header p {
+    margin: 6px 0 0;
     color: #6b7280;
-
-    font-weight: 600;
-}
-
-.region-badge {
-    background: #eef2ff;
-
-    color: #4338ca;
-
-    padding: 9px 18px;
-
-    border-radius: 20px;
-
-    font-weight: 700;
-
     font-size: 14px;
 }
 
-
-/* ============================================================
-   FILTER
-   ============================================================ */
-
-.filter-bar {
-    background: white;
-
-    padding: 15px 18px;
-
-    border-radius: 12px;
-
-    margin-bottom: 18px;
-
-    box-shadow:
-        0 2px 8px rgba(0,0,0,0.05);
-
-    display: flex;
-
-    align-items: center;
-
-    gap: 12px;
-}
-
-.filter-label {
-    font-weight: 700;
-
-    color: #374151;
-
-    font-size: 14px;
-}
-
-.date-container {
+.filter-area {
     position: relative;
+    margin-bottom: 18px;
 }
 
 .date-button {
-    min-width: 240px;
-
+    width: 260px;
+    height: 42px;
+    padding: 0 14px;
     background: white;
-
     border: 1px solid #d1d5db;
-
     border-radius: 8px;
-
-    padding: 10px 14px;
-
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
     cursor: pointer;
-
     font-size: 14px;
-
-    text-align: left;
+    color: #374151;
 }
-
-.date-button:hover {
-    border-color: #6366f1;
-}
-
-.date-arrow {
-    float: right;
-}
-
-
-/* ============================================================
-   DROPDOWN
-   ============================================================ */
 
 .dropdown {
     display: none;
-
     position: absolute;
-
     top: 48px;
-
     left: 0;
-
-    width: 300px;
-
+    width: 320px;
     background: white;
-
     border: 1px solid #d1d5db;
-
     border-radius: 10px;
-
-    box-shadow:
-        0 8px 25px rgba(0,0,0,0.15);
-
-    z-index: 9999;
-
-    padding: 12px;
+    box-shadow: 0 10px 25px rgba(0,0,0,.10);
+    z-index: 999;
 }
 
-.dropdown.show {
-    display: block;
-}
+.dropdown.open { display: block; }
 
 .search-box {
+    padding: 10px;
+    border-bottom: 1px solid #e5e7eb;
+}
+
+.search-box input {
     width: 100%;
-
-    padding: 9px 10px;
-
+    height: 36px;
+    padding: 0 10px;
     border: 1px solid #d1d5db;
-
-    border-radius: 7px;
-
-    margin-bottom: 10px;
-
-    outline: none;
-}
-
-.search-box:focus {
-    border-color: #6366f1;
-}
-
-.action-row {
-    display: flex;
-
-    gap: 8px;
-
-    margin-bottom: 10px;
-}
-
-.small-btn {
-    flex: 1;
-
-    padding: 7px;
-
-    border: 1px solid #d1d5db;
-
-    background: #f9fafb;
-
     border-radius: 6px;
+}
 
+.select-actions {
+    display: flex;
+    gap: 8px;
+    padding: 9px 10px;
+    border-bottom: 1px solid #e5e7eb;
+}
+
+.select-actions button {
+    border: none;
+    background: #f3f4f6;
+    padding: 7px 10px;
+    border-radius: 5px;
     cursor: pointer;
-
-    font-size: 12px;
-
-    font-weight: 600;
 }
 
 .date-list {
-    max-height: 250px;
-
+    max-height: 260px;
     overflow-y: auto;
-
-    border-top: 1px solid #e5e7eb;
-
-    border-bottom: 1px solid #e5e7eb;
-
-    padding: 7px 0;
+    padding: 5px 0;
 }
 
-.date-item {
+.date-option {
     display: flex;
-
     align-items: center;
-
-    gap: 8px;
-
-    padding: 7px 5px;
-
-    font-size: 13px;
-
+    gap: 9px;
+    padding: 8px 12px;
     cursor: pointer;
+    font-size: 13px;
 }
 
-.date-item:hover {
-    background: #f3f4f6;
-}
+.date-option:hover { background: #f9fafb; }
 
 .dropdown-footer {
     display: flex;
-
+    justify-content: flex-end;
     gap: 8px;
-
-    margin-top: 10px;
+    padding: 10px;
+    border-top: 1px solid #e5e7eb;
 }
 
-.apply-btn {
-    flex: 1;
-
-    background: #4f46e5;
-
-    color: white;
-
-    border: none;
-
-    border-radius: 7px;
-
-    padding: 8px;
-
+.dropdown-footer button {
+    height: 34px;
+    padding: 0 14px;
+    border-radius: 6px;
     cursor: pointer;
-
-    font-weight: 700;
 }
 
 .cancel-btn {
-    flex: 1;
-
     background: white;
-
-    color: #374151;
-
     border: 1px solid #d1d5db;
-
-    border-radius: 7px;
-
-    padding: 8px;
-
-    cursor: pointer;
-
-    font-weight: 600;
 }
 
-
-/* ============================================================
-   TABLE
-   ============================================================ */
-
-.table-card {
-    background: white;
-
-    border-radius: 14px;
-
-    box-shadow:
-        0 2px 10px rgba(0,0,0,0.06);
-
-    overflow: hidden;
+.apply-btn {
+    background: #111827;
+    border: 1px solid #111827;
+    color: white;
 }
 
-.table-title {
-    padding: 18px 20px;
-
-    font-size: 18px;
-
-    font-weight: 800;
-
-    border-bottom: 1px solid #e5e7eb;
-
-    color: #111827;
-}
-
-.table-wrapper {
+.table-container {
     width: 100%;
-
     overflow-x: auto;
+    background: white;
+    border: 1px solid #e5e7eb;
+    border-radius: 10px;
+    box-shadow: 0 2px 8px rgba(0,0,0,.04);
 }
 
 table {
     width: 100%;
-
     border-collapse: collapse;
-
-    min-width: 950px;
+    min-width: 900px;
 }
 
 thead th {
-    background: #f8fafc;
-
-    color: #374151;
-
+    background: #111827;
+    color: white;
     font-size: 13px;
-
-    font-weight: 800;
-
-    padding: 13px 10px;
-
-    border-bottom: 1px solid #e5e7eb;
-
+    padding: 13px 12px;
     text-align: center;
+    white-space: nowrap;
 }
 
 tbody td {
-    padding: 13px 10px;
-
-    border-bottom: 1px solid #eef0f3;
-
+    padding: 11px 12px;
+    border-bottom: 1px solid #e5e7eb;
     text-align: center;
-
-    font-size: 14px;
+    font-size: 13px;
+    white-space: nowrap;
 }
 
-tbody tr:hover {
-    background: #fafafa;
+tbody tr:hover { background: #f9fafb; }
+
+.date-cell {
+    font-weight: 600;
+    text-align: left !important;
+    padding-left: 18px !important;
 }
 
-.total-row td {
-    background: #f8fafc;
+.number { font-variant-numeric: tabular-nums; }
 
-    font-weight: 800;
-
-    border-top: 2px solid #d1d5db;
-}
-
-.number {
-    font-weight: 700;
+.hc-input, .rma-input {
+    width: 80px;
+    height: 34px;
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    text-align: center;
+    font-size: 13px;
 }
 
 .kpi {
-    font-weight: 800;
-
-    color: #4f46e5;
-}
-
-.input-box {
-    width: 75px;
-
-    padding: 7px 8px;
-
-    border: 1px solid #d1d5db;
-
-    border-radius: 6px;
-
-    text-align: center;
-
     font-weight: 700;
-
-    outline: none;
+    font-size: 14px;
 }
 
-.input-box:focus {
-    border-color: #6366f1;
+.total-row td {
+    background: #f3f4f6;
+    font-weight: 700;
+    border-top: 2px solid #d1d5db;
 }
 
 .empty {
+    padding: 35px;
     text-align: center;
-
-    padding: 45px;
-
-    color: #9ca3af;
-
-    font-weight: 600;
+    color: #6b7280;
 }
 
-
-/* ============================================================
-   MOBILE
-   ============================================================ */
+.save-status {
+    margin: 10px 0;
+    font-size: 12px;
+    color: #6b7280;
+}
 
 @media (max-width: 700px) {
-
-    .header {
-        padding: 16px;
-    }
-
-    .title {
-        font-size: 22px;
-    }
-
-    .filter-bar {
-        flex-direction: column;
-
-        align-items: stretch;
-    }
-
-    .date-button {
-        width: 100%;
-    }
-
-    .dropdown {
-        width: 300px;
-    }
+    body { padding: 12px; }
+    .header h1 { font-size: 23px; }
+    .date-button { width: 100%; }
+    .dropdown { width: min(320px, 95vw); }
 }
-
 </style>
-
 </head>
-
 
 <body>
 
-
-<!-- ============================================================
-     HEADER
-     ============================================================ -->
-
 <div class="header">
-
-    <div class="header-left">
-
-        <div class="title">
-            QC Testing
-        </div>
-
-        <div class="subtitle">
-            Daily Provisioning Regional KPI
-        </div>
-
-    </div>
-
-    <div class="region-badge">
-        ENUO
-    </div>
-
+    <h1>QC Testing</h1>
+    <p>ENUO</p>
 </div>
 
-
-<!-- ============================================================
-     DATE FILTER
-     ============================================================ -->
-
-<div class="filter-bar">
-
-    <div class="filter-label">
-        Date
-    </div>
-
-    <div class="date-container">
-
-        <button
-            class="date-button"
-            id="dateButton"
+<div class="filter-area">
+    <button class="date-button"
             onclick="toggleDropdown()"
-        >
-            All Dates
-            <span class="date-arrow">▼</span>
-        </button>
+            id="dateButton">
+        <span id="dateButtonText">All Dates</span>
+        <span>▼</span>
+    </button>
 
-
-        <div
-            class="dropdown"
-            id="dateDropdown"
-        >
-
-            <input
-                class="search-box"
-                id="dateSearch"
-                placeholder="Search date..."
-                oninput="filterDates()"
-            >
-
-
-            <div class="action-row">
-
-                <button
-                    class="small-btn"
-                    onclick="selectAllDates()"
-                >
-                    Select All
-                </button>
-
-                <button
-                    class="small-btn"
-                    onclick="clearDates()"
-                >
-                    Clear
-                </button>
-
-            </div>
-
-
-            <div
-                class="date-list"
-                id="dateList"
-            ></div>
-
-
-            <div class="dropdown-footer">
-
-                <button
-                    class="cancel-btn"
-                    onclick="cancelDates()"
-                >
-                    Cancel
-                </button>
-
-                <button
-                    class="apply-btn"
-                    onclick="applyDates()"
-                >
-                    Apply
-                </button>
-
-            </div>
-
+    <div class="dropdown" id="dateDropdown">
+        <div class="search-box">
+            <input id="dateSearch"
+                   placeholder="Search date..."
+                   oninput="filterDates()">
         </div>
 
-    </div>
+        <div class="select-actions">
+            <button onclick="selectAllDates()">Select All</button>
+            <button onclick="clearDates()">Clear</button>
+        </div>
 
+        <div class="date-list" id="dateList"></div>
+
+        <div class="dropdown-footer">
+            <button class="cancel-btn" onclick="cancelDates()">Cancel</button>
+            <button class="apply-btn" onclick="applyDates()">Apply</button>
+        </div>
+    </div>
 </div>
 
-
-<!-- ============================================================
-     TABLE
-     ============================================================ -->
-
-<div class="table-card">
-
-    <div class="table-title">
-        QC Testing Daily Detail
-    </div>
-
-    <div class="table-wrapper">
-
-        <table>
-
-            <thead>
-
-                <tr>
-
-                    <th>DATE</th>
-
-                    <th>QC INBOUND</th>
-
-                    <th>TOTAL TEST</th>
-
-                    <th>QC PASS</th>
-
-                    <th>QC FAIL</th>
-
-                    <th>RMA</th>
-
-                    <th>HC</th>
-
-                    <th>KPI</th>
-
-                </tr>
-
-            </thead>
-
-            <tbody
-                id="tableBody"
-            ></tbody>
-
-        </table>
-
-    </div>
-
+<div class="save-status" id="saveStatus">
+    HC settings loaded from Google Sheets.
 </div>
 
+<div class="table-container">
+<table>
+<thead>
+<tr>
+    <th>DATE</th>
+    <th>QC INBOUND</th>
+    <th>TOTAL TEST</th>
+    <th>QC PASS</th>
+    <th>QC FAIL</th>
+    <th>RMA</th>
+    <th>HC</th>
+    <th>KPI</th>
+</tr>
+</thead>
+<tbody id="tableBody"></tbody>
+</table>
+</div>
 
 <script>
+const DATA = __DATA_JSON__;
+const HC_FROM_SHEET = __HC_DATA_JSON__;
+const HC_API_URL = __HC_API_URL_JSON__;
 
-
-// ============================================================
-// DATA
-// ============================================================
-
-const DATA = __DATA_JSON_PLACEHOLDER__;
-
-
-// ============================================================
-// VARIABLES
-// ============================================================
-
-// Date filter selection persists after refresh / reopening the page.
 const STORAGE_DATES = "ENUO_QC_TESTING_SELECTED_DATES";
+const HC_LOCAL_KEY = "ENUO_QC_TESTING_HC";
+const RMA_LOCAL_KEY = "ENUO_QC_TESTING_RMA";
+
 let selectedDates = [];
-let temporaryDates = [];
-
-
-// ============================================================
-// LOCAL STORAGE
-//
-// HC / RMA ကို browser ထဲမှာ သိမ်းထားမယ်
-// ============================================================
-
-const STORAGE_HC =
-    "ENUO_QC_TESTING_HC";
-
-const STORAGE_RMA =
-    "ENUO_QC_TESTING_RMA";
-
-
-// ============================================================
-// LOAD SAVED HC
-// ============================================================
-
+let tempSelectedDates = [];
 let hcValues = {};
-
-try {
-
-    hcValues =
-        JSON.parse(
-            localStorage.getItem(
-                STORAGE_HC
-            ) || "{}"
-        );
-
-} catch (e) {
-
-    hcValues = {};
-
-}
-
-
-// ============================================================
-// LOAD SAVED RMA
-// ============================================================
-
 let rmaValues = {};
+const HC_CLOUD_DATES = new Set();
 
 try {
-
-    rmaValues =
-        JSON.parse(
-            localStorage.getItem(
-                STORAGE_RMA
-            ) || "{}"
-        );
-
+    hcValues = JSON.parse(localStorage.getItem(HC_LOCAL_KEY) || "{}");
 } catch (e) {
+    hcValues = {};
+}
 
+try {
+    rmaValues = JSON.parse(localStorage.getItem(RMA_LOCAL_KEY) || "{}");
+} catch (e) {
     rmaValues = {};
-
 }
 
 
-// ============================================================
-// ALL DATES
-// ============================================================
+// =========================================================
+// NORMALIZE DATE KEYS FROM GOOGLE SHEETS
+// =========================================================
 
-const allDates = [
-    ...new Set(
-        DATA
-            .map(row => row.date)
-            .filter(date => date)
-    )
-].sort();
+function normalizeDate(value) {
+    if (!value) return "";
 
-// Restore saved date filter. An empty array means "All Dates" so new dates
-// added to the source data will also appear automatically.
+    const s = String(value).trim();
+
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+
+    const parsed = new Date(s);
+    if (Number.isNaN(parsed.getTime())) return s;
+
+    return [
+        parsed.getFullYear(),
+        String(parsed.getMonth() + 1).padStart(2, "0"),
+        String(parsed.getDate()).padStart(2, "0")
+    ].join("-");
+}
+
+function normalizeHCDate(value) {
+    const s = String(value || "").trim();
+
+    // Supports ISO date and the display format from older settings.
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+
+    const months = {
+        jan: "01", feb: "02", mar: "03", apr: "04",
+        may: "05", jun: "06", jul: "07", aug: "08",
+        sep: "09", oct: "10", nov: "11", dec: "12"
+    };
+
+    const match = s.match(/^(\d{1,2})[-\s]([A-Za-z]{3})[-\s](\d{4})$/);
+
+    if (match && months[match[2].toLowerCase()]) {
+        return match[3] + "-" + months[match[2].toLowerCase()]
+            + "-" + match[1].padStart(2, "0");
+    }
+
+    return normalizeDate(s);
+}
+
+
+// =========================================================
+// APPLY CLOUD HC SETTINGS
+// =========================================================
+
+HC_FROM_SHEET.forEach(item => {
+    if (!item || !item.date) return;
+
+    if (String(item.region || "").trim().toUpperCase() !== "ENUO") {
+        return;
+    }
+
+    if (String(item.category || "").trim().toLowerCase() !== "qc") {
+        return;
+    }
+
+    const key = normalizeHCDate(item.date);
+    if (!key) return;
+
+    const hc = Number(item.hc);
+    if (!Number.isFinite(hc)) return;
+
+    hcValues[key] = hc;
+    HC_CLOUD_DATES.add(key);
+});
+
+
+// =========================================================
+// DATE LIST
+// =========================================================
+
+const dateMap = new Map();
+
+DATA.forEach(row => {
+    const key = row.date_sort || normalizeHCDate(row.date);
+    if (key) dateMap.set(key, row.date || key);
+});
+
+const uniqueDates = [...dateMap.keys()].sort();
+
 try {
-    const savedDates = JSON.parse(localStorage.getItem(STORAGE_DATES) || "[]");
-    if (Array.isArray(savedDates) && savedDates.length > 0) {
-        selectedDates = savedDates.filter(date => allDates.includes(date));
+    const saved = JSON.parse(localStorage.getItem(STORAGE_DATES) || "[]");
+
+    if (Array.isArray(saved) && saved.length) {
+        selectedDates = saved.filter(d => uniqueDates.includes(d));
     }
 } catch (e) {
     selectedDates = [];
 }
-temporaryDates = [...selectedDates];
 
+tempSelectedDates = [...selectedDates];
 
-// ============================================================
-// DEFAULT VALUES
-//
-// မရှိသေးတဲ့ date တွေကိုသာ default ထည့်
-// ရှိပြီးသား saved value ကို မထိ
-// ============================================================
-
-allDates.forEach(
-    date => {
-
-        if (
-            hcValues[date] === undefined
-        ) {
-
-            hcValues[date] = 1;
-
-        }
-
-        if (
-            rmaValues[date] === undefined
-        ) {
-
-            rmaValues[date] = 0;
-
-        }
-
-    }
-);
-
-
-// ============================================================
-// SAVE HC
-// ============================================================
-
-function saveHC() {
-
-    localStorage.setItem(
-        STORAGE_HC,
-        JSON.stringify(
-            hcValues
-        )
-    );
-
-}
-
-
-// ============================================================
-// SAVE RMA
-// ============================================================
-
-function saveRMA() {
-
-    localStorage.setItem(
-        STORAGE_RMA,
-        JSON.stringify(
-            rmaValues
-        )
-    );
-
-}
-
-
-// ============================================================
-// FORMAT NUMBER
-// ============================================================
-
-function formatNumber(value) {
-
-    if (!Number.isFinite(value)) {
-
-        return "0";
-
+uniqueDates.forEach(date => {
+    if (hcValues[date] === undefined || hcValues[date] === null || hcValues[date] === "") {
+        hcValues[date] = 1;
     }
 
-    return Number(value).toLocaleString(
-        "en-US",
-        {
-            maximumFractionDigits: 0
-        }
-    );
-
-}
-
-
-// ============================================================
-// KPI WHOLE NUMBER
-// ============================================================
-
-function formatKPI(value) {
-
-    if (!Number.isFinite(value)) {
-
-        return "0";
-
+    if (rmaValues[date] === undefined) {
+        rmaValues[date] = 0;
     }
-
-    return Math.round(value).toString();
-
-}
+});
 
 
-// ============================================================
-// DATE DROPDOWN
-// ============================================================
+// =========================================================
+// DATE FILTER
+// =========================================================
 
 function toggleDropdown() {
+    const dropdown = document.getElementById("dateDropdown");
 
-    const dropdown =
-        document.getElementById(
-            "dateDropdown"
-        );
-
-    if (
-        dropdown.classList.contains(
-            "show"
-        )
-    ) {
-
-        dropdown.classList.remove(
-            "show"
-        );
-
+    if (dropdown.classList.contains("open")) {
+        dropdown.classList.remove("open");
     } else {
-
-        temporaryDates = [
-            ...selectedDates
-        ];
-
+        tempSelectedDates = [...selectedDates];
         renderDateList();
-
-        dropdown.classList.add(
-            "show"
-        );
-
+        dropdown.classList.add("open");
     }
-
 }
 
-
-// ============================================================
-// DATE LIST
-// ============================================================
-
 function renderDateList() {
-
-    const list =
-        document.getElementById(
-            "dateList"
-        );
-
-    const search =
-        document.getElementById(
-            "dateSearch"
-        )
-        .value
-        .toLowerCase()
-        .trim();
-
+    const list = document.getElementById("dateList");
+    const search = document.getElementById("dateSearch").value.trim().toLowerCase();
 
     list.innerHTML = "";
 
+    uniqueDates.forEach(date => {
+        const display = dateMap.get(date) || date;
 
-    allDates
-        .filter(
-            date =>
-                date
-                    .toLowerCase()
-                    .includes(search)
-        )
-        .forEach(
-            date => {
+        if (
+            search &&
+            !date.toLowerCase().includes(search) &&
+            !display.toLowerCase().includes(search)
+        ) return;
 
-                const label =
-                    document.createElement(
-                        "label"
-                    );
+        const label = document.createElement("label");
+        label.className = "date-option";
 
-                label.className =
-                    "date-item";
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.value = date;
+        checkbox.checked = tempSelectedDates.includes(date);
 
-
-                const checkbox =
-                    document.createElement(
-                        "input"
-                    );
-
-                checkbox.type =
-                    "checkbox";
-
-                checkbox.value =
-                    date;
-
-                checkbox.checked =
-                    temporaryDates.includes(
-                        date
-                    );
-
-
-                checkbox.addEventListener(
-                    "change",
-                    function() {
-
-                        if (
-                            this.checked
-                        ) {
-
-                            if (
-                                !temporaryDates.includes(
-                                    date
-                                )
-                            ) {
-
-                                temporaryDates.push(
-                                    date
-                                );
-
-                            }
-
-                        } else {
-
-                            temporaryDates =
-                                temporaryDates.filter(
-                                    d =>
-                                        d !== date
-                                );
-
-                        }
-
-                    }
-                );
-
-
-                const text =
-                    document.createElement(
-                        "span"
-                    );
-
-                text.textContent =
-                    date;
-
-
-                label.appendChild(
-                    checkbox
-                );
-
-                label.appendChild(
-                    text
-                );
-
-                list.appendChild(
-                    label
-                );
-
+        checkbox.addEventListener("change", function() {
+            if (this.checked) {
+                if (!tempSelectedDates.includes(date)) tempSelectedDates.push(date);
+            } else {
+                tempSelectedDates = tempSelectedDates.filter(d => d !== date);
             }
-        );
+        });
 
+        const text = document.createElement("span");
+        text.textContent = display;
+
+        label.append(checkbox, text);
+        list.appendChild(label);
+    });
 }
-
-
-// ============================================================
-// SEARCH
-// ============================================================
 
 function filterDates() {
-
     renderDateList();
-
 }
-
-
-// ============================================================
-// SELECT ALL
-// ============================================================
 
 function selectAllDates() {
-
-    temporaryDates = [
-        ...allDates
-    ];
-
+    tempSelectedDates = [...uniqueDates];
     renderDateList();
-
 }
-
-
-// ============================================================
-// CLEAR
-// ============================================================
 
 function clearDates() {
-
-    temporaryDates = [];
-
+    tempSelectedDates = [];
     renderDateList();
-
 }
-
-
-// ============================================================
-// CANCEL
-// ============================================================
 
 function cancelDates() {
-
-    temporaryDates = [
-        ...selectedDates
-    ];
-
-    document
-        .getElementById(
-            "dateDropdown"
-        )
-        .classList.remove(
-            "show"
-        );
-
+    tempSelectedDates = [...selectedDates];
+    document.getElementById("dateDropdown").classList.remove("open");
 }
-
-
-// ============================================================
-// APPLY
-// ============================================================
 
 function applyDates() {
-
-    selectedDates = [
-        ...temporaryDates
-    ];
-
-    // Save [] for All Dates, so future new dates are included automatically.
-    const datesToSave =
-        selectedDates.length === 0 ||
-        selectedDates.length === allDates.length
-            ? []
-            : selectedDates;
-
-    localStorage.setItem(
-        STORAGE_DATES,
-        JSON.stringify(datesToSave)
-    );
-
-    // Normalize All Dates to [] internally.
-    if (datesToSave.length === 0) {
-        selectedDates = [];
-    }
-
-    document
-        .getElementById(
-            "dateDropdown"
-        )
-        .classList.remove(
-            "show"
-        );
-
-    updateDateButton();
-
-    renderTable();
-
-}
-
-
-// ============================================================
-// DATE BUTTON
-// ============================================================
-
-function updateDateButton() {
-
-    const button =
-        document.getElementById(
-            "dateButton"
-        );
-
+    selectedDates = [...tempSelectedDates].sort();
 
     if (
         selectedDates.length === 0 ||
-        selectedDates.length === allDates.length
+        selectedDates.length === uniqueDates.length
     ) {
-
-        button.innerHTML =
-            `All Dates
-             <span class="date-arrow">▼</span>`;
-
-    } else if (
-        selectedDates.length === 1
-    ) {
-
-        button.innerHTML =
-            `${selectedDates[0]}
-             <span class="date-arrow">▼</span>`;
-
-    } else {
-
-        button.innerHTML =
-            `${selectedDates.length} Dates Selected
-             <span class="date-arrow">▼</span>`;
-
+        selectedDates = [];
     }
 
+    localStorage.setItem(STORAGE_DATES, JSON.stringify(selectedDates));
+
+    document.getElementById("dateDropdown").classList.remove("open");
+
+    updateDateButton();
+    updateTable();
+}
+
+function updateDateButton() {
+    const text = document.getElementById("dateButtonText");
+
+    if (selectedDates.length === 0 || selectedDates.length === uniqueDates.length) {
+        text.textContent = "All Dates";
+    } else if (selectedDates.length === 1) {
+        text.textContent = dateMap.get(selectedDates[0]) || selectedDates[0];
+    } else {
+        text.textContent = selectedDates.length + " Dates Selected";
+    }
 }
 
 
-// ============================================================
-// PREVIOUS DATE
-//
-// ဥပမာ
-//
-// 2026-10-01 row
-// QC Inbound = 2026-09-30 data
-//
-// 2026-10-02 row
-// QC Inbound = 2026-10-01 data
-//
-// 2026-10-01 မှာ 2026-09-30 (31 ရက်)
-// ရဲ့ QC Inbound ကို ပြမယ်
-// ============================================================
+// =========================================================
+// NUMBER FORMATTING
+// =========================================================
 
-function getPreviousDate(date) {
+function number(value) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : 0;
+}
 
-    const d =
-        new Date(
-            date + "T00:00:00"
-        );
+function formatNumber(value) {
+    return Math.round(number(value)).toLocaleString("en-US");
+}
 
-    d.setDate(
-        d.getDate() - 1
-    );
-
-    return d
-        .toISOString()
-        .split("T")[0];
-
+function formatKPI(value) {
+    return String(Math.round(number(value)));
 }
 
 
-// ============================================================
-// QC INBOUND CALCULATION
-//
-// IMPORTANT:
-// QC Inbound ကို row ရဲ့နေ့မှာ မတွက်ဘူး
-// မနေ့က data ကို ဒီနေ့ row ထဲထည့်မယ်
-// ============================================================
-
-// ============================================================
+// =========================================================
 // QC INBOUND
-// 1 DAY SHIFT ONLY
 //
-// Example:
-// 2026-09-30 data -> 2026-10-01 row
-// 2026-10-01 data -> 2026-10-02 row
-// 2026-10-02 data -> 2026-10-03 row
-// ============================================================
+// Use the previous available source date, not calendar yesterday.
+// RUN -> MAC count
+// NEW -> Qty sum
+// CLEANING + FFO -> Qty sum
+// =========================================================
 
 function calculateQCInbound(targetDate) {
+    const currentIndex = uniqueDates.indexOf(targetDate);
 
-    // Dashboard မှာ တကယ်ရှိတဲ့ dates တွေကိုပဲယူ
-    const availableDates = [...new Set(
-        DATA
-            .map(row => row.date)
-            .filter(d => d)
-    )].sort();
+    if (currentIndex <= 0) return 0;
 
-    // Current date ရဲ့ index
-    const currentIndex = availableDates.indexOf(targetDate);
-
-    // ပထမဆုံး date ဆိုရင် previous date မရှိ
-    if (currentIndex <= 0) {
-        return 0;
-    }
-
-    // Calendar previous day မဟုတ်ဘဲ
-    // Date list ထဲက ရှေ့ကရှိတဲ့ date ကိုယူ
-    const sourceDate = availableDates[currentIndex - 1];
-
+    const sourceDate = uniqueDates[currentIndex - 1];
     let total = 0;
 
     DATA.forEach(row => {
+        const rowDate = row.date_sort || normalizeHCDate(row.date);
+        if (rowDate !== sourceDate) return;
 
-        if (row.date !== sourceDate) return;
-
-        const daily = String(row.daily || "")
-            .trim()
-            .toLowerCase();
-
-        const device = String(row.device || "")
-            .trim()
-            .toLowerCase();
-
+        const daily = String(row.daily || "").trim().toLowerCase();
+        const device = String(row.device || "").trim().toLowerCase();
         const mac = String(row.mac || "").trim();
+        const qty = number(row.qty);
 
-        const qty = Number(row.qty) || 0;
-
-        // RUN → MAC Count
         if (daily === "run" && mac !== "" && mac.toLowerCase() !== "nan") {
             total += 1;
         }
 
-        // NEW → Qty Sum
         if (daily === "new") {
             total += qty;
         }
 
-        // CLEANING + FFO → Qty Sum
         if (daily === "cleaning" && device === "ffo") {
             total += qty;
         }
@@ -1465,561 +797,325 @@ function calculateQCInbound(targetDate) {
 }
 
 
-// ============================================================
-// NORMAL DAILY CALCULATION
+// =========================================================
+// DAILY CALCULATION
 //
-// TOTAL TEST / PASS / FAIL
-// မပြောင်း
-// ============================================================
+// TOTAL TEST = SPEED TEST + LAN PORT TEST + DBM (Qty sum)
+// PASS = Issue Type USE
+// FAIL = Issue Type RMA
+// RMA input remains manually editable, as in the earlier code.
+// =========================================================
 
 function calculate(date) {
-
-    const rows =
-        DATA.filter(
-            row =>
-                row.date === date
-        );
-
-
-    // =========================================================
-    // QC INBOUND
-    //
-    // မနေ့က data ကို ဒီနေ့ row ထဲထည့်
-    // =========================================================
-
-    const qcInbound =
-        calculateQCInbound(
-            date
-        );
-
-
     let totalTest = 0;
-
     let qcPass = 0;
-
     let qcFail = 0;
 
-
-    rows.forEach(
-        row => {
-
-            const daily =
-                String(
-                    row.daily || ""
-                )
-                .trim()
-                .toLowerCase();
-
-
-            const issueType =
-                String(
-                    row.issueType || ""
-                )
-                .trim()
-                .toLowerCase();
-
-
-            const qty =
-                Number(
-                    row.qty
-                ) || 0;
-
-
-            // =================================================
-            // TOTAL TEST
-            //
-            // SPEED TEST
-            // LAN PORT TEST
-            // DBM
-            //
-            // ALL = QTY SUM
-            // =================================================
-
-            if (
-                daily === "speed test" ||
-                daily === "lan port test" ||
-                daily === "dbm"
-            ) {
-
-                totalTest += qty;
-
-
-                // =============================================
-                // QC PASS
-                // =============================================
-
-                if (
-                    issueType === "use"
-                ) {
-
-                    qcPass += qty;
-
-                }
-
-
-                // =============================================
-                // QC FAIL
-                // =============================================
-
-                if (
-                    issueType === "rma"
-                ) {
-
-                    qcFail += qty;
-
-                }
-
-            }
-
-        }
-    );
-
-
-    // =========================================================
-    // SAVED MANUAL RMA
-    // =========================================================
-
-    const rma =
-        Number(
-            rmaValues[date]
-        ) || 0;
-
-
-    // =========================================================
-    // SAVED MANUAL HC
-    // =========================================================
-
-    const hc =
-        Number(
-            hcValues[date]
-        ) || 0;
-
-
-    // =========================================================
-    // KPI
-    // =========================================================
-
-    const kpi =
-        hc > 0
-            ? totalTest / hc
-            : 0;
-
-
-    return {
-
-        date: date,
-
-        qcInbound: qcInbound,
-
-        totalTest: totalTest,
-
-        qcPass: qcPass,
-
-        qcFail: qcFail,
-
-        rma: rma,
-
-        hc: hc,
-
-        kpi: kpi
-
-    };
-
-}
-
-
-// ============================================================
-// UPDATE HC
-//
-// ရိုက်ပြီးတာနဲ့ Local Storage ထဲသိမ်း
-// ============================================================
-
-function updateHC(
-    date,
-    value
-) {
-
-    hcValues[date] =
-        Number(value) || 0;
-
-
-    saveHC();
-
-    renderTable();
-
-}
-
-
-// ============================================================
-// UPDATE RMA
-//
-// ရိုက်ပြီးတာနဲ့ Local Storage ထဲသိမ်း
-// ============================================================
-
-function updateRMA(
-    date,
-    value
-) {
-
-    rmaValues[date] =
-        Number(value) || 0;
-
-
-    saveRMA();
-
-    renderTable();
-
-}
-
-
-// ============================================================
-// RENDER TABLE
-// ============================================================
-
-function renderTable() {
-
-    const body =
-        document.getElementById(
-            "tableBody"
-        );
-
-
-    body.innerHTML = "";
-
-
-    let datesToShow;
-
-
-    if (
-        selectedDates.length === 0 ||
-        selectedDates.length === allDates.length
-    ) {
-
-        datesToShow = [
-            ...allDates
-        ];
-
-    } else {
-
-        datesToShow = [
-            ...selectedDates
-        ].sort();
-
-    }
-
-
-    if (
-        datesToShow.length === 0
-    ) {
-
-        body.innerHTML = `
-            <tr>
-                <td
-                    colspan="8"
-                    class="empty"
-                >
-                    No Date Selected
-                </td>
-            </tr>
-        `;
-
-        return;
-
-    }
-
-
-    let grandQCInbound = 0;
-
-    let grandTotalTest = 0;
-
-    let grandQCPass = 0;
-
-    let grandQCFail = 0;
-
-    let grandRMA = 0;
-
-    let grandHC = 0;
-
-
-    // =========================================================
-    // DAILY ROWS
-    // =========================================================
-
-    datesToShow.forEach(
-        date => {
-
-            const result =
-                calculate(date);
-
-
-            grandQCInbound +=
-                result.qcInbound;
-
-            grandTotalTest +=
-                result.totalTest;
-
-            grandQCPass +=
-                result.qcPass;
-
-            grandQCFail +=
-                result.qcFail;
-
-            grandRMA +=
-                result.rma;
-
-            grandHC +=
-                result.hc;
-
-
-            const tr =
-                document.createElement(
-                    "tr"
-                );
-
-
-            tr.innerHTML = `
-
-                <td>
-                    <strong>
-                        ${result.date}
-                    </strong>
-                </td>
-
-
-                <td class="number">
-                    ${formatNumber(
-                        result.qcInbound
-                    )}
-                </td>
-
-
-                <td class="number">
-                    ${formatNumber(
-                        result.totalTest
-                    )}
-                </td>
-
-
-                <td class="number">
-                    ${formatNumber(
-                        result.qcPass
-                    )}
-                </td>
-
-
-                <td class="number">
-                    ${formatNumber(
-                        result.qcFail
-                    )}
-                </td>
-
-
-                <td>
-
-                    <input
-                        class="input-box"
-                        type="number"
-                        min="0"
-                        step="1"
-                        value="${result.rma}"
-                        onchange="
-                            updateRMA(
-                                '${result.date}',
-                                this.value
-                            )
-                        "
-                    >
-
-                </td>
-
-
-                <td>
-
-                    <input
-                        class="input-box"
-                        type="number"
-                        min="0"
-                        step="1"
-                        value="${result.hc}"
-                        onchange="
-                            updateHC(
-                                '${result.date}',
-                                this.value
-                            )
-                        "
-                    >
-
-                </td>
-
-
-                <td class="kpi">
-                    ${formatKPI(
-                        result.kpi
-                    )}
-                </td>
-
-            `;
-
-
-            body.appendChild(
-                tr
-            );
-
-        }
-    );
-
-
-    // =========================================================
-    // TOTAL KPI
-    // =========================================================
-
-    const totalKPI =
-        grandHC > 0
-            ? grandTotalTest / grandHC
-            : 0;
-
-
-    // =========================================================
-    // TOTAL ROW
-    // =========================================================
-
-    const totalRow =
-        document.createElement(
-            "tr"
-        );
-
-    totalRow.className =
-        "total-row";
-
-
-    totalRow.innerHTML = `
-
-        <td>
-            TOTAL
-        </td>
-
-
-        <td>
-            ${formatNumber(
-                grandQCInbound
-            )}
-        </td>
-
-
-        <td>
-            ${formatNumber(
-                grandTotalTest
-            )}
-        </td>
-
-
-        <td>
-            ${formatNumber(
-                grandQCPass
-            )}
-        </td>
-
-
-        <td>
-            ${formatNumber(
-                grandQCFail
-            )}
-        </td>
-
-
-        <td>
-            ${formatNumber(
-                grandRMA
-            )}
-        </td>
-
-
-        <td>
-            ${formatNumber(
-                grandHC
-            )}
-        </td>
-
-
-        <td class="kpi">
-            ${formatKPI(
-                totalKPI
-            )}
-        </td>
-
-    `;
-
-
-    body.appendChild(
-        totalRow
-    );
-
-}
-
-
-// ============================================================
-// CLICK OUTSIDE
-// ============================================================
-
-document.addEventListener(
-    "click",
-    function(event) {
-
-        const dropdown =
-            document.getElementById(
-                "dateDropdown"
-            );
-
-        const button =
-            document.getElementById(
-                "dateButton"
-            );
-
+    DATA.forEach(row => {
+        const rowDate = row.date_sort || normalizeHCDate(row.date);
+        if (rowDate !== date) return;
+
+        const daily = String(row.daily || "").trim().toLowerCase();
+        const issueType = String(row.issue_type || "").trim().toLowerCase();
+        const qty = number(row.qty);
 
         if (
-            !dropdown.contains(
-                event.target
-            ) &&
-            !button.contains(
-                event.target
-            )
+            daily === "speed test" ||
+            daily === "lan port test" ||
+            daily === "dbm"
         ) {
+            totalTest += qty;
 
-            dropdown.classList.remove(
-                "show"
-            );
+            if (issueType === "use") {
+                qcPass += qty;
+            }
 
+            if (issueType === "rma") {
+                qcFail += qty;
+            }
         }
+    });
 
+    return {
+        qcInbound: calculateQCInbound(date),
+        totalTest,
+        qcPass,
+        qcFail,
+        rma: number(rmaValues[date])
+    };
+}
+
+
+// =========================================================
+// SAVE HC TO LOCAL STORAGE AND GOOGLE SHEETS
+// =========================================================
+
+function setStatus(message) {
+    document.getElementById("saveStatus").textContent = message;
+}
+
+function saveHC(date, value) {
+    let hc = Number(value);
+
+    if (!Number.isFinite(hc) || hc < 0) hc = 0;
+
+    hcValues[date] = hc;
+
+    try {
+        localStorage.setItem(HC_LOCAL_KEY, JSON.stringify(hcValues));
+    } catch (e) {}
+
+    updateTable();
+    postHCToGoogleSheet(date, hc);
+}
+
+async function postHCToGoogleSheet(date, hc) {
+    setStatus("Saving HC for " + date + " to Google Sheets...");
+
+    try {
+        // no-cors does not expose the server response to the browser.
+        // This sends the request but cannot verify the sheet was updated.
+        await fetch(HC_API_URL, {
+            method: "POST",
+            mode: "no-cors",
+            headers: {
+                "Content-Type": "text/plain;charset=utf-8"
+            },
+            body: JSON.stringify({
+                date: date,
+                region: "ENUO",
+                category: "qc",
+                hc: Number(hc)
+            })
+        });
+
+        setStatus(
+            "HC save request sent for " + date +
+            ". Reopen or refresh to verify the saved value."
+        );
+    } catch (error) {
+        setStatus(
+            "HC save request failed. The value remains in this browser only."
+        );
+        console.error(error);
     }
-);
+}
 
 
-// ============================================================
-// INITIAL DATA
-// ============================================================
+// =========================================================
+// SAVE MANUAL RMA
+// =========================================================
+
+function saveRMA(date, value) {
+    let rma = Number(value);
+
+    if (!Number.isFinite(rma) || rma < 0) rma = 0;
+
+    rmaValues[date] = rma;
+
+    try {
+        localStorage.setItem(RMA_LOCAL_KEY, JSON.stringify(rmaValues));
+    } catch (e) {}
+
+    updateTable();
+}
+
+
+// =========================================================
+// INITIALIZE MISSING HC
+//
+// Do not overwrite existing cloud HC.
+// Missing defaults are 1 and are submitted to the API.
+// The no-cors request cannot confirm server-side success.
+// =========================================================
+
+async function autoSaveMissingHC() {
+    for (const date of uniqueDates) {
+        if (HC_CLOUD_DATES.has(date)) continue;
+
+        const hc = number(hcValues[date] ?? 1);
+
+        try {
+            await fetch(HC_API_URL, {
+                method: "POST",
+                mode: "no-cors",
+                headers: {
+                    "Content-Type": "text/plain;charset=utf-8"
+                },
+                body: JSON.stringify({
+                    date: date,
+                    region: "ENUO",
+                    category: "qc",
+                    hc: hc
+                })
+            });
+
+            // Do not mark as confirmed: no-cors cannot verify a successful write.
+        } catch (error) {
+            console.error("Default HC request failed:", date, error);
+        }
+    }
+}
+
+
+// =========================================================
+// RENDER TABLE
+// =========================================================
+
+function updateTable() {
+    const tbody = document.getElementById("tableBody");
+    tbody.innerHTML = "";
+
+    const datesToShow = (
+        selectedDates.length === 0 ||
+        selectedDates.length === uniqueDates.length
+    ) ? [...uniqueDates] : [...selectedDates];
+
+    datesToShow.sort();
+
+    if (!datesToShow.length) {
+        tbody.innerHTML = `
+            <tr>
+                <td colspan="8" class="empty">No date selected</td>
+            </tr>
+        `;
+        return;
+    }
+
+    let grandInbound = 0;
+    let grandTest = 0;
+    let grandPass = 0;
+    let grandFail = 0;
+    let grandRMA = 0;
+    let grandHC = 0;
+
+    datesToShow.forEach(date => {
+        const result = calculate(date);
+        const hc = number(hcValues[date]);
+        const kpi = hc > 0 ? result.totalTest / hc : 0;
+
+        grandInbound += result.qcInbound;
+        grandTest += result.totalTest;
+        grandPass += result.qcPass;
+        grandFail += result.qcFail;
+        grandRMA += result.rma;
+        grandHC += hc;
+
+        const tr = document.createElement("tr");
+
+        const dateCell = document.createElement("td");
+        dateCell.className = "date-cell";
+        dateCell.textContent = dateMap.get(date) || date;
+        tr.appendChild(dateCell);
+
+        [
+            result.qcInbound,
+            result.totalTest,
+            result.qcPass,
+            result.qcFail
+        ].forEach(value => {
+            const td = document.createElement("td");
+            td.className = "number";
+            td.textContent = formatNumber(value);
+            tr.appendChild(td);
+        });
+
+        const rmaCell = document.createElement("td");
+        const rmaInput = document.createElement("input");
+        rmaInput.className = "rma-input";
+        rmaInput.type = "number";
+        rmaInput.min = "0";
+        rmaInput.step = "1";
+        rmaInput.value = result.rma;
+        rmaInput.addEventListener("change", () => saveRMA(date, rmaInput.value));
+        rmaCell.appendChild(rmaInput);
+        tr.appendChild(rmaCell);
+
+        const hcCell = document.createElement("td");
+        const hcInput = document.createElement("input");
+        hcInput.className = "hc-input";
+        hcInput.type = "number";
+        hcInput.min = "0";
+        hcInput.step = "1";
+        hcInput.value = hc;
+        hcInput.addEventListener("change", () => saveHC(date, hcInput.value));
+        hcCell.appendChild(hcInput);
+        tr.appendChild(hcCell);
+
+        const kpiCell = document.createElement("td");
+        kpiCell.className = "kpi";
+        kpiCell.textContent = formatKPI(kpi);
+        tr.appendChild(kpiCell);
+
+        tbody.appendChild(tr);
+    });
+
+    const grandKPI = grandHC > 0 ? grandTest / grandHC : 0;
+
+    const totalRow = document.createElement("tr");
+    totalRow.className = "total-row";
+
+    [
+        "TOTAL",
+        formatNumber(grandInbound),
+        formatNumber(grandTest),
+        formatNumber(grandPass),
+        formatNumber(grandFail),
+        formatNumber(grandRMA),
+        formatNumber(grandHC),
+        formatKPI(grandKPI)
+    ].forEach((value, index) => {
+        const td = document.createElement("td");
+        td.textContent = value;
+
+        if (index === 0) td.className = "date-cell";
+        if (index === 7) td.className = "kpi";
+
+        totalRow.appendChild(td);
+    });
+
+    tbody.appendChild(totalRow);
+}
+
+
+// =========================================================
+// INITIAL LOAD
+// =========================================================
 
 renderDateList();
-
 updateDateButton();
+updateTable();
+autoSaveMissingHC();
 
-renderTable();
+document.addEventListener("click", function(event) {
+    const area = document.querySelector(".filter-area");
 
+    if (!area.contains(event.target)) {
+        document.getElementById("dateDropdown").classList.remove("open");
+    }
+});
 </script>
-
 </body>
-
 </html>
 """
 
-
 # ============================================================
-# INSERT JSON
+# INSERT JSON SAFELY
 # ============================================================
 
 html = html.replace(
-    "__DATA_JSON_PLACEHOLDER__",
-    data_json
+    "__DATA_JSON__",
+    data_json.replace("</", "<\\/"),
+)
+
+html = html.replace(
+    "__HC_DATA_JSON__",
+    hc_json.replace("</", "<\\/"),
+)
+
+html = html.replace(
+    "__HC_API_URL_JSON__",
+    json.dumps(HC_API_URL),
 )
 
 
@@ -2030,5 +1126,5 @@ html = html.replace(
 components.html(
     html,
     height=850,
-    scrolling=True
+    scrolling=True,
 )

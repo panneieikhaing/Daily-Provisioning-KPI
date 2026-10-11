@@ -25,6 +25,9 @@ st.set_page_config(
 ENUO_HGAO_SHEET_ID = "14WOHloWhGuQOc95PrRUsYWAHT6PTCC6EL2pY18uglVs"
 MDY_SHEET_ID = "1XrjpVgSeu1lDpyNNyuJdjYji8MxnoQWuo3bwwPWAs9Q"
 
+# Apps Script Web App URL for shared HC settings
+HC_API_URL = "https://script.google.com/macros/s/AKfycbxtIHI5c0dgeT_ZzcqaD5CAncYtrhyxLi3Bl3LLmMyzY-GEGaRG6zjmpp4K8ui0LElOeg/exec"
+
 SHEET1_TAB = ""
 SHEET2_TAB = ""
 
@@ -224,6 +227,27 @@ def clean_data(df):
 
 
 # ============================================================
+# LOAD SHARED HC SETTINGS FROM APPS SCRIPT
+# ============================================================
+
+def load_hc_from_google_sheet():
+    """Load shared HC values keyed by Date + Region + Category."""
+    try:
+        response = requests.get(HC_API_URL, timeout=25)
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict) or not result.get("success"):
+            message = result.get("error", "Unexpected response from HC API") if isinstance(result, dict) else str(result)
+            st.warning(f"HC settings could not be loaded: {message}")
+            return []
+        records = result.get("data", [])
+        return records if isinstance(records, list) else []
+    except Exception as exc:
+        st.warning(f"HC settings could not be loaded: {exc}")
+        return []
+
+
+# ============================================================
 # LOAD BOTH SHEETS
 # ============================================================
 
@@ -310,7 +334,10 @@ records = data[
 data_json = json.dumps(
     records,
     ensure_ascii=False
-)
+).replace("</", "<\\/")
+
+hc_records = load_hc_from_google_sheet()
+hc_json = json.dumps(hc_records, ensure_ascii=False).replace("</", "<\\/")
 
 
 # ============================================================
@@ -1497,120 +1524,85 @@ const DEFAULT_HC = {
 
 
 // ============================================================
-// HC LOCAL STORAGE
+// SHARED HC SETTINGS (GOOGLE SHEET VIA APPS SCRIPT)
 // ============================================================
 
-const HC_STORAGE_KEY =
-    "daily_provisioning_hc_v2";
+const HC_API_URL = __HC_API_URL_PLACEHOLDER__;
+const HC_FROM_SHEET = __HC_DATA_PLACEHOLDER__;
+let HC_DATA = {};
 
+function hcKey(date, region, category) {
+    const normalizedRegion = String(region).toUpperCase() === "MDY" ? "PI44" : String(region).toUpperCase();
+    return String(date) + "|" + normalizedRegion + "|" + String(category).toLowerCase();
+}
 
-function loadHC() {
+HC_FROM_SHEET.forEach(item => {
+    if (item && item.date && item.region && item.category !== undefined && item.hc !== undefined) {
+        HC_DATA[hcKey(item.date, item.region, item.category)] = Number(item.hc) || 0;
+    }
+});
 
-    try {
+const HC_SAVE_TIMERS = {};
 
-        const saved =
-            localStorage.getItem(
-                HC_STORAGE_KEY
-            );
+function getHC(date, region, category) {
+    const key = hcKey(date, region, category);
+    if (Object.prototype.hasOwnProperty.call(HC_DATA, key)) {
+        return Number(HC_DATA[key]) || 0;
+    }
+    return Object.prototype.hasOwnProperty.call(DEFAULT_HC, category)
+        ? Number(DEFAULT_HC[category]) || 0
+        : 0;
+}
 
-        if (saved) {
-
-            return JSON.parse(
-                saved
-            );
-
+async function autoSaveMissingRegionalHC() {
+    const dates = [...new Set(DATA.map(row => String(row.Date || "").trim()).filter(Boolean))];
+    const regions = [
+        {dataRegion:"ENUO", hcRegion:"ENUO", categories:["cleaning","terminal","default"]},
+        {dataRegion:"HGAO", hcRegion:"HGAO", categories:["cleaning","terminal","default","qc"]},
+        {dataRegion:"MDY", hcRegion:"PI44", categories:["cleaning","terminal","default","qc","rma"]}
+    ];
+    for (const date of dates) {
+        for (const item of regions) {
+            if (!DATA.some(row => String(row.Region || "").toUpperCase() === item.dataRegion && String(row.Date || "").trim() === date)) continue;
+            for (const category of item.categories) {
+                const key = hcKey(date, item.hcRegion, category);
+                if (Object.prototype.hasOwnProperty.call(HC_DATA, key)) continue;
+                const hc = Object.prototype.hasOwnProperty.call(DEFAULT_HC, category) ? Number(DEFAULT_HC[category]) || 0 : 0;
+                HC_DATA[key] = hc;
+                try {
+                    await fetch(HC_API_URL, {method:"POST", mode:"no-cors", headers:{"Content-Type":"text/plain;charset=utf-8"}, body:JSON.stringify({date, region:item.hcRegion, category, hc})});
+                } catch (err) { console.error("Default HC save failed", key, err); }
+            }
         }
-
-    } catch (e) {
-
-        console.log(e);
-
     }
-
-    return {};
-
 }
 
+function setHC(date, region, category, value) {
+    let hc = parseFloat(value);
+    if (!Number.isFinite(hc) || hc < 0) hc = 0;
 
-let HC_DATA = loadHC();
-
-
-function saveHC() {
-
-    localStorage.setItem(
-        HC_STORAGE_KEY,
-        JSON.stringify(HC_DATA)
-    );
-
-}
-
-
-// ============================================================
-// HC
-// ============================================================
-
-function getHC(
-    date,
-    region,
-    category
-) {
-
-    const key =
-        date +
-        "|" +
-        region +
-        "|" +
-        category;
-
-
-    if (
-        HC_DATA[key] !== undefined
-    ) {
-
-        return HC_DATA[key];
-
-    }
-
-
-    return (
-        DEFAULT_HC[category] || 0
-    );
-
-}
-
-
-function setHC(
-    date,
-    region,
-    category,
-    value
-) {
-
-    let hc =
-        parseFloat(value);
-
-
-    if (!Number.isFinite(hc)) {
-
-        hc = 0;
-
-    }
-
-
-    const key =
-        date +
-        "|" +
-        region +
-        "|" +
-        category;
-
-
+    const key = hcKey(date, region, category);
     HC_DATA[key] = hc;
-
-    saveHC();
-
     render();
 
+    if (HC_SAVE_TIMERS[key]) clearTimeout(HC_SAVE_TIMERS[key]);
+    HC_SAVE_TIMERS[key] = setTimeout(() => {
+        fetch(HC_API_URL, {
+            method: "POST",
+            mode: "no-cors",
+            headers: { "Content-Type": "text/plain;charset=utf-8" },
+            body: JSON.stringify({
+                date: String(date),
+                region: (String(region).toUpperCase() === "MDY" ? "PI44" : String(region).toUpperCase()),
+                category: String(category).toLowerCase(),
+                hc: hc
+            })
+        }).then(() => {
+            console.log("HC save request sent:", key);
+        }).catch(error => {
+            console.error("HC save request failed:", error);
+        });
+    }, 400);
 }
 
 
@@ -1787,20 +1779,24 @@ function calculate(
 
 
         const qc =
-            jd
-            .filter(
-                r =>
-                    r.jd === "speed test" ||
-                    r.jd === "lanport test" ||
-                    r.jd === "dbm"
-            )
-            .reduce(
-                (sum, r) =>
-                    sum +
-                    Number(r.Qty || 0),
-                0
-            );
+    jd
+    .filter(r => {
+        const type = String(r.jd || "")
+            .trim()
+            .toLowerCase()
+            .replace(/\s+/g, " ");
 
+        return (
+            type === "speed test" ||
+            type === "lanport test" ||
+            type === "lan port test" ||
+            type === "dbm"
+        );
+    })
+    .reduce(
+        (sum, r) => sum + (Number(r.Qty) || 0),
+        0
+    );
 
         const total =
             cleaning +
@@ -1860,42 +1856,25 @@ function calculate(
             );
 
 
-        const qc =
-            jd
-            .filter(
-                r => {
+       const qc =
+    jd
+    .filter(r => {
+        const type = String(r.jd || "")
+            .trim()
+            .toLowerCase()
+            .replace(/\s+/g, " ");
 
-                    const type =
-                        String(
-                            r.jd || ""
-                        )
-                        .trim()
-                        .toLowerCase()
-                        .replace(
-                            /\s+/g,
-                            " "
-                        );
-
-                    return (
-                        type === "speed test" ||
-                        type === "lan port test" ||
-                        type === "dbm"
-                    );
-
-                }
-            )
-            .reduce(
-                (sum, r) => {
-
-                    return (
-                        sum +
-                        (Number(r.Qty) || 0)
-                    );
-
-                },
-                0
-            );
-
+        return (
+            type === "dbm" ||
+            type === "speed test" ||
+            type === "lan port test" ||
+            type === "lanport test"
+        );
+    })
+    .reduce(
+        (sum, r) => sum + (Number(r.Qty) || 0),
+        0
+    );
 
         const rma =
             jd
@@ -2411,39 +2390,11 @@ function renderRegion(
 // DATE FILTER STATE
 // ============================================================
 
+const DATE_STORAGE_KEY = "regional_kpi_selected_dates_v1";
+
 let appliedDates = null;
 
 let tempDates = null;
-
-// Remember the last applied date filter in this browser.
-const DATE_FILTER_STORAGE_KEY = "daily_provisioning_selected_dates_v1";
-
-function loadSavedDates(allDates) {
-    try {
-        const saved = localStorage.getItem(DATE_FILTER_STORAGE_KEY);
-        if (saved !== null) {
-            const parsed = JSON.parse(saved);
-            if (Array.isArray(parsed)) {
-                // Remove dates that are no longer present in the latest Sheet data.
-                return parsed.filter(date => allDates.includes(date));
-            }
-        }
-    } catch (e) {
-        console.log("Could not load saved date filter:", e);
-    }
-    return [...allDates];
-}
-
-function saveSelectedDates() {
-    try {
-        localStorage.setItem(
-            DATE_FILTER_STORAGE_KEY,
-            JSON.stringify(appliedDates || [])
-        );
-    } catch (e) {
-        console.log("Could not save date filter:", e);
-    }
-}
 
 
 // ============================================================
@@ -2778,13 +2729,22 @@ function setupDates() {
         getAllDates();
 
 
-    // Restore the last applied selection when the page is opened again.
-    appliedDates =
-        loadSavedDates(dates);
+    let savedDates = null;
+    try {
+        const raw = localStorage.getItem(DATE_STORAGE_KEY);
+        if (raw !== null) {
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) savedDates = parsed.map(String);
+        }
+    } catch (e) {
+        savedDates = null;
+    }
 
+    appliedDates = savedDates === null
+        ? [...dates]
+        : savedDates.filter(date => dates.includes(date));
 
-    tempDates =
-        [...appliedDates];
+    tempDates = [...appliedDates];
 
 
     buildDateList("");
@@ -3193,8 +3153,11 @@ function applyDateFilter() {
     appliedDates =
         [...tempDates];
 
-    saveSelectedDates();
-
+    try {
+        localStorage.setItem(DATE_STORAGE_KEY, JSON.stringify(appliedDates));
+    } catch (e) {
+        console.warn("Could not save date filter:", e);
+    }
 
     updateDateButton();
 
@@ -3436,6 +3399,8 @@ setupDates();
 render();
 
 
+autoSaveMissingRegionalHC();
+
 </script>
 
 
@@ -3452,6 +3417,14 @@ render();
 html = html.replace(
     "__DATA_PLACEHOLDER__",
     data_json
+)
+html = html.replace(
+    "__HC_DATA_PLACEHOLDER__",
+    hc_json
+)
+html = html.replace(
+    "__HC_API_URL_PLACEHOLDER__",
+    json.dumps(HC_API_URL)
 )
 
 
