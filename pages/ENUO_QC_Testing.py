@@ -35,7 +35,6 @@ SHEET_TAB = ""
 # LOAD GOOGLE SHEET
 # ============================================================
 
-@st.cache_data(ttl=300)
 def load_google_sheet():
 
     if SHEET_TAB:
@@ -54,8 +53,15 @@ def load_google_sheet():
             f"tqx=out:csv"
         )
 
+    # Always fetch the latest Google Sheet data when this page reruns.
+    # Do not use Streamlit cache here; other pages already update on navigation.
     response = requests.get(
         url,
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
         timeout=30
     )
 
@@ -67,12 +73,13 @@ def load_google_sheet():
 
 
 # ============================================================
-# LOAD
+# LOAD LATEST DATA ON EVERY PAGE RUN
 # ============================================================
 
 try:
 
-    df = load_google_sheet()
+    with st.spinner("Loading latest Google Sheet data..."):
+        df = load_google_sheet()
 
 except Exception as e:
 
@@ -859,8 +866,9 @@ const DATA = __DATA_JSON_PLACEHOLDER__;
 // VARIABLES
 // ============================================================
 
+// Date filter selection persists after refresh / reopening the page.
+const STORAGE_DATES = "ENUO_QC_TESTING_SELECTED_DATES";
 let selectedDates = [];
-
 let temporaryDates = [];
 
 
@@ -932,6 +940,18 @@ const allDates = [
             .filter(date => date)
     )
 ].sort();
+
+// Restore saved date filter. An empty array means "All Dates" so new dates
+// added to the source data will also appear automatically.
+try {
+    const savedDates = JSON.parse(localStorage.getItem(STORAGE_DATES) || "[]");
+    if (Array.isArray(savedDates) && savedDates.length > 0) {
+        selectedDates = savedDates.filter(date => allDates.includes(date));
+    }
+} catch (e) {
+    selectedDates = [];
+}
+temporaryDates = [...selectedDates];
 
 
 // ============================================================
@@ -1263,6 +1283,23 @@ function applyDates() {
         ...temporaryDates
     ];
 
+    // Save [] for All Dates, so future new dates are included automatically.
+    const datesToSave =
+        selectedDates.length === 0 ||
+        selectedDates.length === allDates.length
+            ? []
+            : selectedDates;
+
+    localStorage.setItem(
+        STORAGE_DATES,
+        JSON.stringify(datesToSave)
+    );
+
+    // Normalize All Dates to [] internally.
+    if (datesToSave.length === 0) {
+        selectedDates = [];
+    }
+
     document
         .getElementById(
             "dateDropdown"
@@ -1409,8 +1446,13 @@ function calculateQCInbound(targetDate) {
         const qty = Number(row.qty) || 0;
 
         // RUN → MAC Count
-        if (daily === "run" && mac !== "") {
+        if (daily === "run" && mac !== "" && mac.toLowerCase() !== "nan") {
             total += 1;
+        }
+
+        // NEW → Qty Sum
+        if (daily === "new") {
+            total += qty;
         }
 
         // CLEANING + FFO → Qty Sum
@@ -1958,6 +2000,8 @@ document.addEventListener(
 // ============================================================
 
 renderDateList();
+
+updateDateButton();
 
 renderTable();
 

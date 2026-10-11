@@ -980,9 +980,34 @@ const STORAGE_KEY =
 // DATE STATE
 // =====================================================
 
+const DATE_STORAGE_KEY = "rma_dashboard_selected_dates_v1";
+
 let selectedDates = [];
 
 let temporaryDates = [];
+
+function loadSavedDates() {
+    try {
+        const raw = localStorage.getItem(DATE_STORAGE_KEY);
+        if (raw === null) return null;
+
+        const saved = JSON.parse(raw);
+        return Array.isArray(saved) ? saved.map(String) : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+function saveSelectedDates() {
+    try {
+        localStorage.setItem(
+            DATE_STORAGE_KEY,
+            JSON.stringify(selectedDates)
+        );
+    } catch (e) {
+        console.warn("Could not save date filter:", e);
+    }
+}
 
 
 // =====================================================
@@ -1609,6 +1634,8 @@ function applyDateFilter() {
     selectedDates =
         [...temporaryDates];
 
+    // Save the chosen dates so they remain selected after refresh/reopen.
+    saveSelectedDates();
 
     document.getElementById(
         "dateDropdown"
@@ -2081,14 +2108,18 @@ function render() {
 
 function setupDates() {
 
-    const dates =
-        getAllDates();
+    const dates = getAllDates();
+    const savedDates = loadSavedDates();
 
-    selectedDates =
-        [...dates];
+    if (savedDates === null) {
+        // First visit: show all available dates.
+        selectedDates = [...dates];
+    } else {
+        // Restore saved selection, but ignore dates no longer in the sheet.
+        selectedDates = savedDates.filter(date => dates.includes(date));
+    }
 
-    temporaryDates =
-        [...dates];
+    temporaryDates = [...selectedDates];
 
     renderDateList();
 

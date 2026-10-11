@@ -1791,7 +1791,8 @@ function calculate(
             .filter(
                 r =>
                     r.jd === "speed test" ||
-                    r.jd === "lanport test"
+                    r.jd === "lanport test" ||
+                    r.jd === "dbm"
             )
             .reduce(
                 (sum, r) =>
@@ -1877,7 +1878,8 @@ function calculate(
 
                     return (
                         type === "speed test" ||
-                        type === "lan port test"
+                        type === "lan port test" ||
+                        type === "dbm"
                     );
 
                 }
@@ -2413,6 +2415,36 @@ let appliedDates = null;
 
 let tempDates = null;
 
+// Remember the last applied date filter in this browser.
+const DATE_FILTER_STORAGE_KEY = "daily_provisioning_selected_dates_v1";
+
+function loadSavedDates(allDates) {
+    try {
+        const saved = localStorage.getItem(DATE_FILTER_STORAGE_KEY);
+        if (saved !== null) {
+            const parsed = JSON.parse(saved);
+            if (Array.isArray(parsed)) {
+                // Remove dates that are no longer present in the latest Sheet data.
+                return parsed.filter(date => allDates.includes(date));
+            }
+        }
+    } catch (e) {
+        console.log("Could not load saved date filter:", e);
+    }
+    return [...allDates];
+}
+
+function saveSelectedDates() {
+    try {
+        localStorage.setItem(
+            DATE_FILTER_STORAGE_KEY,
+            JSON.stringify(appliedDates || [])
+        );
+    } catch (e) {
+        console.log("Could not save date filter:", e);
+    }
+}
+
 
 // ============================================================
 // ALL AVAILABLE DATES
@@ -2746,12 +2778,13 @@ function setupDates() {
         getAllDates();
 
 
+    // Restore the last applied selection when the page is opened again.
     appliedDates =
-        [...dates];
+        loadSavedDates(dates);
 
 
     tempDates =
-        [...dates];
+        [...appliedDates];
 
 
     buildDateList("");
@@ -3159,6 +3192,8 @@ function applyDateFilter() {
 
     appliedDates =
         [...tempDates];
+
+    saveSelectedDates();
 
 
     updateDateButton();
