@@ -1851,7 +1851,7 @@ function calculate(
             macCount(
                 jd.filter(
                     r =>
-                        r.jd === "mac/dbm"
+                        r.jd === "default"
                 )
             );
 
