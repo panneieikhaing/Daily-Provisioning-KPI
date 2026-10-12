@@ -37,8 +37,8 @@ FILTER_SECTION = "individual_kpi"
 
 CALCULATION_RULES = [
     ("RUN", "run", "MAC Count", "ALL"),
-    ("Default", "default", "MAC Count", "ENUO_HGAO"),
-    ("MAC / DBM", "mac/dbm", "MAC Count", "MDY"),
+    ("Default", "default", "MAC Count", "ALL"),
+
     ("DBM", "dbm", "Qty Sum", "ALL"),
     ("Cleaning", "cleaning", "Qty Sum", "ALL"),
     ("Speed Test", "speed test", "Qty Sum", "ALL"),
@@ -46,10 +46,23 @@ CALCULATION_RULES = [
     ("RMA", "rma", "Qty Sum", "ALL"),
     ("Test RMA", "test rma", "Qty Sum", "ALL"),
     ("Accessories", "accessories", "Qty Sum", "ALL"),
+    ("Battery", "battery", "Qty Sum", "ALL"),
+    ("DC Port Change", "dc port change", "Qty Sum", "ALL"),
+    ("Glueattach", "glueattach", "Qty Sum", "ALL"),
+    ("Injector Test", "injector test", "Qty Sum", "ALL"),
+    ("Leave", "leave", "Name Count", "ALL"),
+    ("Terminal Test", "terminal test", "Qty Sum", "ALL"),
+    ("WAN Port Test", "wan port test", "Qty Sum", "ALL"),
     ("MAC", "mac", "Qty Sum", "ALL"),
     ("Exchange Test", "exchange test", "Qty Sum", "ALL"),
     ("Cover Change", "cover change", "Qty Sum", "ALL"),
     ("Infra", "infra", "Qty Sum", "ALL"),
+    ("In & Out", "in & out", "Qty Sum", "ALL"),
+    ("Flang Change", "flang change", "Qty Sum", "ALL"),
+    ("14V", "14v", "Qty Sum", "ALL"),
+    ("Remove Mini Battery", "remove mini battery", "Qty Sum", "ALL"),
+    ("Soldering Mini CPE", "soldering mini cpe", "Qty Sum", "ALL"),
+    ("Glue Mini Module", "glue mini module", "Qty Sum", "ALL"),
 ]
 
 SUMMARY_CATEGORIES = [rule[0] for rule in CALCULATION_RULES]
@@ -399,6 +412,8 @@ def calculate_category_value(data, category, region):
 
     if rule[2] == "MAC Count":
         return count_nonblank_mac(data)
+    if rule[2] == "Name Count":
+        return 1 if not data.empty else 0
 
     return int(round(float(data["Qty"].sum())))
 
@@ -425,7 +440,7 @@ def find_rule_for_task(task_key, region):
 # ============================================================
 # DAILY SUMMARY
 # ============================================================
-
+@st.cache_data(show_spinner=False)
 def create_summary(data):
     columns = (
         ["Date", "Region", "Name"]
@@ -437,82 +452,125 @@ def create_summary(data):
         return pd.DataFrame(columns=columns)
 
     rows = []
-
     for (date, region, name), group in data.groupby(
-        ["Date", "Region", "Name"],
-        dropna=False,
+        ["Date", "Region", "Name"], dropna=False
     ):
-        row = {
-            "Date": date,
-            "Region": region,
-            "Name": name,
-        }
+        row = {"Date": date, "Region": region, "Name": name}
+        numeric_total = 0
 
         for category in SUMMARY_CATEGORIES:
-            rule = next(
-                item for item in CALCULATION_RULES
-                if item[0] == category
-            )
+            rule = next(item for item in CALCULATION_RULES if item[0] == category)
             rule_key = normalize_task(rule[1])
+            matching = group[group["Task Key"].map(
+                lambda value: rule_key in normalize_task(value)
+            )]
 
-            matching = group[
-                group["Task Key"].map(
-                    lambda value: rule_key in normalize_task(value)
-                )
-            ]
-
+            # Prevent overlapping task names from being double-counted.
             if category == "RMA":
-                matching = matching[
-                    ~matching["Task Key"].map(
-                        lambda value: "test rma" in normalize_task(value)
-                    )
-                ]
+                matching = matching[~matching["Task Key"].map(
+                    lambda value: "test rma" in normalize_task(value)
+                )]
+            elif category == "Battery":
+                matching = matching[~matching["Task Key"].map(
+                    lambda value: "remove mini battery" in normalize_task(value)
+                )]
+            elif category in {"MAC", "DBM"}:
+                matching = matching[~matching["Task Key"].map(
+                    lambda value: "mac/dbm" in normalize_task(value)
+                    or "mac dbm" in normalize_task(value)
+                )]
 
+            # MAC / DBM applies only to the MDY source task label.
             if category == "MAC / DBM":
-                matching = group[
-                    group["Task Key"].map(
-                        lambda value: (
-                            "mac/dbm" in normalize_task(value)
-                            or "mac dbm" in normalize_task(value)
-                        )
-                    )
-                ]
+                matching = group[group["Task Key"].map(
+                    lambda value: "mac/dbm" in normalize_task(value)
+                    or "mac dbm" in normalize_task(value)
+                )]
 
-            row[category] = calculate_category_value(
-                matching, category, region
-            )
+            if category == "Leave":
+                row[category] = "Leave" if not matching.empty else 0
+                continue
 
-        row["Total Count"] = sum(
-            row[category] for category in SUMMARY_CATEGORIES
-        )
+            value = calculate_category_value(matching, category, region)
+            row[category] = value
+            numeric_total += value
+
+        row["Total Count"] = numeric_total
         rows.append(row)
 
     return pd.DataFrame(rows, columns=columns)
 
 
+
 # ============================================================
 # DAILY TOTAL
 # ============================================================
+@st.cache_data(show_spinner=False)
 
 def create_daily_total(summary):
-    columns = ["Date", "Name", "Total"]
-
+    columns = ["Date", "Name", "Total", "Meet KPI"]
     if summary.empty:
         return pd.DataFrame(columns=columns)
 
-    total = summary.groupby(
-        ["Date", "Name"],
-        as_index=False,
-        dropna=False,
-    )["Total Count"].sum()
+    rows = []
+    for (date, name), group in summary.groupby(["Date", "Name"], dropna=False):
+        total = int(round(pd.to_numeric(
+            group["Total Count"], errors="coerce"
+        ).fillna(0).sum()))
 
-    return total.rename(columns={"Total Count": "Total"})
+        has_leave = group.get("Leave", pd.Series(dtype=object)).map(
+            lambda value: isinstance(value, str) and value.strip().casefold() == "leave"
+        ).any()
+
+        # Existing KPI target is 150. Extra rules are only checked for NO rows.
+        if total >= 150:
+            status = "YES"
+        elif has_leave:
+            status = "Leave"
+        else:
+            status = "NO"
+            extra_yes_categories = [
+                "Battery", "DC Port Change", "Glueattach", "WAN Port Test",
+                "Infra", "MAC", "Cover Change", "Flang Change", "14V",
+                "Remove Mini Battery", "Soldering Mini CPE", "Glue Mini Module",
+                "Exchange Test",
+            ]
+            for category in extra_yes_categories:
+                if category in group.columns and pd.to_numeric(
+                    group[category], errors="coerce"
+                ).fillna(0).ge(1).any():
+                    status = "YES"
+                    break
+
+            if status == "NO":
+                rma_qty = pd.to_numeric(group.get("RMA", 0), errors="coerce")
+                test_rma_qty = pd.to_numeric(group.get("Test RMA", 0), errors="coerce")
+                if (rma_qty >= 40).any() or (test_rma_qty >= 40).any():
+                    status = "YES"
+
+        if has_leave and total > 0:
+            total_display = f"Leave, {total:,}"
+        elif has_leave:
+            total_display = "Leave"
+        else:
+            total_display = total
+
+        rows.append({
+            "Date": date,
+            "Name": name,
+            "Total": total_display,
+            "Meet KPI": status,
+        })
+
+    result = pd.DataFrame(rows, columns=columns)
+    return result.sort_values(["Date", "Name"], ascending=[False, True]).reset_index(drop=True)
+
 
 
 # ============================================================
 # DAILY DETAIL
 # ============================================================
-
+@st.cache_data(show_spinner=False)
 def create_daily_detail(data):
     columns = [
         "Date", "Region", "Name", "Device Name",
@@ -831,12 +889,18 @@ def render_shared_filter(data):
 # DISPLAY HELPERS
 # ============================================================
 
+
+# ============================================================
+# DISPLAY HELPERS
+# ============================================================
+
 def format_number(value):
     if pd.isna(value):
         return "0"
 
     if isinstance(value, Number):
         number = float(value)
+
         if number.is_integer():
             return f"{int(number):,}"
 
@@ -864,14 +928,41 @@ def show_table(df, numeric_columns=None, height=440):
         df, numeric_columns or []
     )
 
-    st.dataframe(
-        display_df,
-        use_container_width=True,
-        hide_index=True,
-        height=height,
-    )
+    # Color the KPI status text
+    if "Meet KPI" in display_df.columns:
+        def color_status(value):
+            status = str(value).strip().upper()
 
+            if status == "YES":
+                return "color: #15803D; font-weight: 800;"
 
+            if status == "NO":
+                return "color: #DC2626; font-weight: 800;"
+
+            if status == "LEAVE":
+                return "color: #D97706; font-weight: 800;"
+
+            return ""
+
+        styled_df = display_df.style.map(
+            color_status,
+            subset=["Meet KPI"],
+        )
+
+        st.dataframe(
+            styled_df,
+            use_container_width=True,
+            hide_index=True,
+            height=height,
+        )
+
+    else:
+        st.dataframe(
+            display_df,
+            use_container_width=True,
+            hide_index=True,
+            height=height,
+        )
 # ============================================================
 # MAIN APP
 # ============================================================
@@ -884,21 +975,91 @@ st.markdown(
 )
 
 
+# ============================================================
+# MODERN DASHBOARD STYLING
+# ============================================================
 
 st.markdown("""
 <style>
+/* Main page spacing */
+.block-container {
+    padding-top: 1.2rem !important;
+    padding-bottom: 2rem !important;
+    padding-left: 2rem !important;
+    padding-right: 2rem !important;
+    max-width: 100% !important;
+}
+
+/* Page title */
 .main-title {
     text-align: center;
     width: 100%;
-    font-size: 2.5rem;
-    font-weight: 700;
-    margin-top: 0;
-    margin-bottom: 3rem;
+    font-size: 2.3rem;
+    font-weight: 800;
+    color: #17365D;
+    margin: 0.2rem 0 1.5rem 0;
+    padding-bottom: 0.8rem;
+    border-bottom: 3px solid #DCE6F1;
+}
+
+/* Section titles */
+h2, h3 {
+    color: #17365D !important;
+    font-weight: 750 !important;
+}
+
+/* More spacing between Streamlit blocks */
+div[data-testid="stVerticalBlock"] {
+    gap: 0.8rem;
+}
+
+/* Buttons */
+div[data-testid="stButton"] > button {
+    border-radius: 9px;
+    min-height: 40px;
+    font-weight: 650;
+    border: 1px solid #D5DFEA;
+    transition: all 0.2s ease;
+}
+
+div[data-testid="stButton"] > button:hover {
+    border-color: #2563EB;
+    color: #2563EB;
+}
+
+/* Filter panel */
+div[data-testid="stExpander"] {
+    border: 1px solid #DCE6F1;
+    border-radius: 12px;
+    background: #FFFFFF;
+}
+
+/* Table container */
+div[data-testid="stDataFrame"] {
+    border: 1px solid #DCE6F1;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 3px 12px rgba(15, 23, 42, 0.06);
+}
+
+/* Divider between report sections */
+hr {
+    margin-top: 1.6rem !important;
+    margin-bottom: 1.6rem !important;
+    border-color: #DCE6F1 !important;
+}
+
+/* Info and warning boxes */
+div[data-testid="stAlert"] {
+    border-radius: 10px;
+}
+
+/* Footer */
+small {
+    color: #64748B;
 }
 </style>
-
 """, unsafe_allow_html=True)
-
 
 # ============================================================
 # LOAD DATA
@@ -962,11 +1123,13 @@ show_table(
     height=280,
 )
 
+st.markdown("<div style='height: 28px'></div>",
+            unsafe_allow_html=True)
+
 
 # ============================================================
 # DAILY SUMMARY
 # ============================================================
-
 st.subheader("Daily Summary")
 
 summary_columns = (
@@ -975,7 +1138,9 @@ summary_columns = (
     + ["Total Count"]
 )
 
-summary_display = summary_df.reindex(columns=summary_columns)
+summary_display = summary_df.reindex(
+    columns=summary_columns
+)
 
 show_table(
     summary_display,
@@ -983,39 +1148,19 @@ show_table(
     height=420,
 )
 
+st.markdown("<div style='height: 28px'></div>",
+            unsafe_allow_html=True)
+
+
 
 # ============================================================
 # CALCULATION RULES
 # ============================================================
 
-with st.expander("View Calculation Rules"):
-    rules_df = pd.DataFrame(
-        CALCULATION_RULES,
-        columns=[
-            "Category",
-            "Task Match",
-            "Calculation",
-            "Applicable Region",
-        ],
-    )
-
-    st.dataframe(
-        rules_df,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    st.caption(
-        "MAC Count = count of non-empty MAC values. "
-        "Qty Sum = sum of Qty values. "
-        "Region restrictions are applied as shown above."
-    )
-
 
 # ============================================================
 # DAILY DETAIL
 # ============================================================
-
 st.subheader("Daily Detail")
 
 show_table(
@@ -1026,12 +1171,11 @@ show_table(
     height=480,
 )
 
-
 # ============================================================
 # FOOTER
 # ============================================================
 
 st.caption(
     "Data source: ENUO/HGAO sheet and MDY sheet. "
-    "Data refresh cache: 60 seconds."
+    "Data refresh cache: 20 seconds."
 )
