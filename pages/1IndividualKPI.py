@@ -45,6 +45,7 @@ CALCULATION_RULES = [
     ("Lan Port Test", "lan port test", "Qty Sum", "ALL"),
     ("RMA", "rma", "Qty Sum", "ALL"),
     ("Test RMA", "test rma", "Qty Sum", "ALL"),
+    ("12V RMA Test", "12v rma test", "Qty Sum", "ALL"),
     ("Accessories", "accessories", "Qty Sum", "ALL"),
     ("Battery", "battery", "Qty Sum", "ALL"),
     ("DC Port Change", "dc port change", "Qty Sum", "ALL"),
@@ -133,9 +134,14 @@ def normalize_text(value):
 
 
 def normalize_task(value):
-    text = normalize_text(value)
-    text = text.replace("_", " ").replace("-", " ")
-    return re.sub(r"\s+", " ", text).strip()
+    """Compare task labels exactly (case-insensitive, trim outer whitespace only).
+
+    Internal spaces, hyphens, underscores and punctuation are preserved so
+    similarly named tasks never get merged accidentally.
+    """
+    if pd.isna(value):
+        return ""
+    return str(value).strip().casefold()
 
 
 def find_column(df, aliases):
@@ -187,7 +193,7 @@ def numeric_series(series):
 # LOAD GOOGLE SHEETS
 # ============================================================
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=20, show_spinner=False)
 def download_google_sheet(sheet_id: str, tab_name: str = ""):
     url = (
         f"https://docs.google.com/spreadsheets/d/"
@@ -280,15 +286,12 @@ def normalize_columns(df, default_region=""):
     else:
         result["Region"] = default_region
 
+    # Do NOT forward-fill Name. A blank Name belongs to its own "-" group;
+    # it must never be attributed to the person in the row above.
     if name_col:
-        result["Name"] = (
-            clean_string_column(df[name_col])
-            .replace("", pd.NA)
-            .ffill()
-            .fillna("")
-        )
+        result["Name"] = clean_string_column(df[name_col]).replace("", "-")
     else:
-        result["Name"] = "Unknown"
+        result["Name"] = "-"
 
     result["Device Name"] = (
         clean_string_column(df[device_col])
@@ -296,6 +299,7 @@ def normalize_columns(df, default_region=""):
         else ""
     )
     result["Daily (JD)"] = clean_string_column(df[daily_col])
+    qty_raw = clean_string_column(df[qty_col])
     result["Qty"] = numeric_series(df[qty_col])
     result["MAC"] = clean_string_column(df[mac_col])
 
@@ -322,9 +326,40 @@ def normalize_columns(df, default_region=""):
     result["Name"] = clean_string_column(result["Name"])
     result["Task Key"] = result["Daily (JD)"].map(normalize_task)
 
+    # Daily (JD) must always be present. Qty is required for Qty-based tasks,
+    # but MAC-count tasks (including RUN and Default) must still count a row
+    # when Qty is blank as long as MAC is present.
+    valid_task = result["Daily (JD)"].astype(str).str.strip().ne("")
+    valid_qty = qty_raw.astype(str).str.strip().ne("")
+    valid_qty &= pd.to_numeric(
+        qty_raw.astype(str).str.replace(",", "", regex=False).str.strip(),
+        errors="coerce",
+    ).notna()
+
+    mac_count_task_keys = {
+        normalize_task(rule[1])
+        for rule in CALCULATION_RULES
+        if rule[2] == "MAC Count"
+    }
+    leave_task_keys = {
+        normalize_task(rule[1])
+        for rule in CALCULATION_RULES
+        if rule[2] == "Name Count"
+    }
+    is_mac_count_task = result["Task Key"].isin(mac_count_task_keys)
+    is_name_count_task = result["Task Key"].isin(leave_task_keys)
+    has_mac = result["MAC"].fillna("").astype(str).str.strip().ne("")
+
+    # Qty-based tasks require Qty. RUN/Default count nonblank MAC values,
+    # and Leave rows must remain valid even when their Qty cell is blank.
+    valid_row = (
+        valid_qty
+        | (is_mac_count_task & has_mac)
+        | is_name_count_task
+    )
+
     result = result[
-        (result["Date"] != "")
-        & (result["Daily (JD)"].str.strip() != "")
+        result["Date"].ne("") & valid_task & valid_row
     ].copy()
 
     return result
@@ -430,7 +465,9 @@ def find_rule_for_task(task_key, region):
     for rule in rules:
         key = normalize_task(rule[1])
 
-        if key and (task_key == key or key in task_key):
+        # Match only the complete normalized Daily (JD) label.
+        # For example, RMA must not match Test RMA or 12V RMA Test.
+        if key and task_key == key:
             if rule_applies(rule, region):
                 return rule
 
@@ -442,12 +479,41 @@ def find_rule_for_task(task_key, region):
 # ============================================================
 @st.cache_data(show_spinner=False)
 def create_summary(data):
-    columns = (
-        ["Date", "Region", "Name"]
-        + SUMMARY_CATEGORIES
-        + ["Total Count"]
-    )
+    """Build columns from Daily (JD) labels currently present in Google Sheets."""
+    known_by_key = {normalize_task(rule[1]): rule for rule in CALCULATION_RULES}
+    present_labels = {}
 
+    if not data.empty:
+        for task in data["Daily (JD)"].fillna("").astype(str):
+            label = task.strip()
+            key = normalize_task(label)
+            if key:
+                present_labels.setdefault(key, label)
+
+    # Use configured display names only for exact known task labels.
+    # New or renamed tasks use the exact label currently found in Google Sheets.
+    # RUN and Default are always shown because they are core KPI columns.
+    # Their values are calculated from nonblank MAC counts, not Qty sums.
+    categories = ["RUN", "Default"]
+    for key, label in present_labels.items():
+        rule = known_by_key.get(key)
+        display_label = rule[0] if rule else label
+        if display_label not in categories:
+            categories.append(display_label)
+
+    # Keep stable ordering for configured tasks, and retain dynamically found
+    # task labels. RUN and Default stay visible even if the current filter has
+    # no matching rows, in which case their value is 0.
+    known_categories = ["RUN", "Default"] + [
+        rule[0] for rule in CALCULATION_RULES
+        if normalize_task(rule[1]) in present_labels
+        and rule[0] not in {"RUN", "Default"}
+    ]
+    known_categories = list(dict.fromkeys(known_categories))
+    extra_categories = [c for c in categories if c not in known_categories]
+    categories = known_categories + extra_categories
+
+    columns = ["Date", "Region", "Name"] + categories + ["Total Count"]
     if data.empty:
         return pd.DataFrame(columns=columns)
 
@@ -458,42 +524,29 @@ def create_summary(data):
         row = {"Date": date, "Region": region, "Name": name}
         numeric_total = 0
 
-        for category in SUMMARY_CATEGORIES:
-            rule = next(item for item in CALCULATION_RULES if item[0] == category)
-            rule_key = normalize_task(rule[1])
-            matching = group[group["Task Key"].map(
-                lambda value: rule_key in normalize_task(value)
-            )]
+        for category in categories:
+            rule = next(
+                (item for item in CALCULATION_RULES if item[0] == category),
+                None,
+            )
+            task_key = normalize_task(rule[1]) if rule else normalize_task(category)
+            matching = group[
+                group["Task Key"].map(normalize_task).eq(task_key)
+            ]
 
-            # Prevent overlapping task names from being double-counted.
-            if category == "RMA":
-                matching = matching[~matching["Task Key"].map(
-                    lambda value: "test rma" in normalize_task(value)
-                )]
-            elif category == "Battery":
-                matching = matching[~matching["Task Key"].map(
-                    lambda value: "remove mini battery" in normalize_task(value)
-                )]
-            elif category in {"MAC", "DBM"}:
-                matching = matching[~matching["Task Key"].map(
-                    lambda value: "mac/dbm" in normalize_task(value)
-                    or "mac dbm" in normalize_task(value)
-                )]
-
-            # MAC / DBM applies only to the MDY source task label.
-            if category == "MAC / DBM":
-                matching = group[group["Task Key"].map(
-                    lambda value: "mac/dbm" in normalize_task(value)
-                    or "mac dbm" in normalize_task(value)
-                )]
-
-            if category == "Leave":
+            if category == "Leave" and rule is not None:
                 row[category] = "Leave" if not matching.empty else 0
                 continue
 
-            value = calculate_category_value(matching, category, region)
+            if rule is not None:
+                value = calculate_category_value(matching, category, region)
+            else:
+                # Every unrecognized or renamed task defaults to Qty Sum.
+                value = int(round(float(matching["Qty"].sum())))
+
             row[category] = value
-            numeric_total += value
+            if isinstance(value, Number):
+                numeric_total += value
 
         row["Total Count"] = numeric_total
         rows.append(row)
@@ -506,47 +559,71 @@ def create_summary(data):
 # DAILY TOTAL
 # ============================================================
 @st.cache_data(show_spinner=False)
-
 def create_daily_total(summary):
+    """Calculate KPI per exact Date + Name group using current Sheet tasks."""
     columns = ["Date", "Name", "Total", "Meet KPI"]
     if summary.empty:
         return pd.DataFrame(columns=columns)
 
+    metadata_columns = {"Date", "Region", "Name", "Total Count"}
+    task_columns = [c for c in summary.columns if c not in metadata_columns]
+
+    # These five tasks need a combined Qty of 150 when used by themselves.
+    threshold_tasks = {
+        "Cleaning", "Default", "RUN", "Lan Port Test", "Speed Test",
+    }
+    rma_tasks = {"RMA", "Test RMA"}
+
     rows = []
     for (date, name), group in summary.groupby(["Date", "Name"], dropna=False):
+        # Summary is grouped by Date + Region + Name; combine regions only for
+        # the same exact Date + Name, never across different people or dates.
         total = int(round(pd.to_numeric(
             group["Total Count"], errors="coerce"
         ).fillna(0).sum()))
 
         has_leave = group.get("Leave", pd.Series(dtype=object)).map(
-            lambda value: isinstance(value, str) and value.strip().casefold() == "leave"
+            lambda value: isinstance(value, str)
+            and value.strip().casefold() == "leave"
         ).any()
 
-        # Existing KPI target is 150. Extra rules are only checked for NO rows.
+        task_values = {}
+        for category in task_columns:
+            if category == "Leave":
+                continue
+            task_values[category] = float(pd.to_numeric(
+                group[category], errors="coerce"
+            ).fillna(0).sum())
+
+        active_threshold_tasks = any(
+            task_values.get(task, 0) > 0 for task in threshold_tasks
+        )
+        active_rma_tasks = any(task_values.get(task, 0) > 0 for task in rma_tasks)
+        rma_total = sum(task_values.get(task, 0) for task in rma_tasks)
+
+        # KPI rules, in priority order:
+        # 1) Total >= 150 => YES.
+        # 2) RMA + Test RMA combined Qty >= 40 => YES.
+        # 3) RMA/Test RMA together with any of the five threshold tasks => YES,
+        #    even when total is below 150 (e.g. RMA 30 + Cleaning 60).
+        # 4) Any other task (e.g. Infra) with Qty >= 1 => YES.
+        # 5) Threshold tasks alone need the combined Total to reach 150.
         if total >= 150:
             status = "YES"
         elif has_leave:
             status = "Leave"
+        elif rma_total >= 40:
+            status = "YES"
+        elif active_rma_tasks and active_threshold_tasks:
+            status = "YES"
+        elif any(
+            value >= 1
+            for task, value in task_values.items()
+            if task not in threshold_tasks and task not in rma_tasks
+        ):
+            status = "YES"
         else:
             status = "NO"
-            extra_yes_categories = [
-                "Battery", "DC Port Change", "Glueattach", "WAN Port Test",
-                "Infra", "MAC", "Cover Change", "Flang Change", "14V",
-                "Remove Mini Battery", "Soldering Mini CPE", "Glue Mini Module",
-                "Exchange Test",
-            ]
-            for category in extra_yes_categories:
-                if category in group.columns and pd.to_numeric(
-                    group[category], errors="coerce"
-                ).fillna(0).ge(1).any():
-                    status = "YES"
-                    break
-
-            if status == "NO":
-                rma_qty = pd.to_numeric(group.get("RMA", 0), errors="coerce")
-                test_rma_qty = pd.to_numeric(group.get("Test RMA", 0), errors="coerce")
-                if (rma_qty >= 40).any() or (test_rma_qty >= 40).any():
-                    status = "YES"
 
         if has_leave and total > 0:
             total_display = f"Leave, {total:,}"
@@ -563,7 +640,9 @@ def create_daily_total(summary):
         })
 
     result = pd.DataFrame(rows, columns=columns)
-    return result.sort_values(["Date", "Name"], ascending=[False, True]).reset_index(drop=True)
+    return result.sort_values(
+        ["Date", "Name"], ascending=[False, True]
+    ).reset_index(drop=True)
 
 
 
@@ -1132,19 +1211,15 @@ st.markdown("<div style='height: 28px'></div>",
 # ============================================================
 st.subheader("Daily Summary")
 
-summary_columns = (
-    ["Date", "Region", "Name"]
-    + SUMMARY_CATEGORIES
-    + ["Total Count"]
-)
-
-summary_display = summary_df.reindex(
-    columns=summary_columns
-)
+# Include dynamically discovered Daily (JD) categories as well.
+summary_display = summary_df.copy()
 
 show_table(
     summary_display,
-    numeric_columns=SUMMARY_CATEGORIES + ["Total Count"],
+    numeric_columns=[
+        column for column in summary_display.columns
+        if column not in {"Date", "Region", "Name", "Total Count", "Leave"}
+    ] + ["Total Count"],
     height=420,
 )
 
